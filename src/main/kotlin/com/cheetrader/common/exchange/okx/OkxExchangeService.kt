@@ -1,6 +1,7 @@
 package com.cheetrader.common.exchange.okx
 
 import com.cheetrader.common.exchange.ExchangeService
+import com.cheetrader.common.exchange.extractMultiTpParams
 import com.cheetrader.common.exchange.extractTrailingParams
 import com.cheetrader.common.exchange.formatPrice
 import com.cheetrader.common.logging.ExchangeLogger
@@ -161,25 +162,56 @@ class OkxExchangeService(
                 stopLoss = signal.stopLoss
             )
 
+            // Check for multi-stage TP
+            val multiTp = extractMultiTpParams(signal.metadata, safeTp)
+
             val orderResult = placeOrder(
                 instId = instId,
                 side = side,
                 posSide = posSide,
                 quantity = quantity,
-                takeProfit = safeTp,
+                takeProfit = if (multiTp != null) null else safeTp,
                 stopLoss = safeSl
             )
 
             if (orderResult.isSuccess) {
                 val orderId = orderResult.getOrThrow()
                 val conditionalErrors = mutableListOf<String>()
+                val closeSide = if (isBuy) OkxConstants.SIDE_SELL else OkxConstants.SIDE_BUY
+
+                // Multi-stage take-profit orders
+                if (multiTp != null) {
+                    val precision = quantity.scale()
+                    val tp1Qty = quantity.multiply(BigDecimal.valueOf(multiTp.tp1Pct / 100.0))
+                        .setScale(precision, RoundingMode.DOWN)
+                    val tp2Qty = quantity.multiply(BigDecimal.valueOf(multiTp.tp2Pct / 100.0))
+                        .setScale(precision, RoundingMode.DOWN)
+                    val tp3Qty = quantity.subtract(tp1Qty).subtract(tp2Qty)
+
+                    if (tp1Qty > BigDecimal.ZERO && tp2Qty > BigDecimal.ZERO) {
+                        val tp1Result = placeTpAlgoOrder(instId, closeSide, posSide, multiTp.tp1, tp1Qty)
+                        if (tp1Result.isFailure) conditionalErrors.add("TP1: ${tp1Result.exceptionOrNull()?.message}")
+
+                        val tp2Result = placeTpAlgoOrder(instId, closeSide, posSide, multiTp.tp2, tp2Qty)
+                        if (tp2Result.isFailure) conditionalErrors.add("TP2: ${tp2Result.exceptionOrNull()?.message}")
+
+                        if (multiTp.tp3 != null && tp3Qty > BigDecimal.ZERO) {
+                            val tp3Result = placeTpAlgoOrder(instId, closeSide, posSide, multiTp.tp3, tp3Qty)
+                            if (tp3Result.isFailure) conditionalErrors.add("TP3: ${tp3Result.exceptionOrNull()?.message}")
+                        }
+                    } else {
+                        // Fallback: quantities too small for splitting, use single TP
+                        val tpResult = placeTpAlgoOrder(instId, closeSide, posSide, multiTp.tp1, quantity)
+                        if (tpResult.isFailure) conditionalErrors.add("TP: ${tpResult.exceptionOrNull()?.message}")
+                    }
+                }
 
                 // Trailing stop via algo order
                 val trailingParams = extractTrailingParams(signal.metadata)
                 if (trailingParams != null) {
                     val trailingResult = placeTrailingStopAlgo(
                         instId = instId,
-                        side = if (isBuy) OkxConstants.SIDE_SELL else OkxConstants.SIDE_BUY,
+                        side = closeSide,
                         posSide = posSide,
                         sz = quantity,
                         callbackRatio = trailingParams.deviation,
@@ -434,6 +466,52 @@ class OkxExchangeService(
             logger.error { "OKX order id missing. Response: $response" }
             Result.failure(OkxException("OKX order id missing"))
         }
+    }
+
+    private suspend fun placeTpAlgoOrder(
+        instId: String,
+        side: String,
+        posSide: String?,
+        triggerPrice: Double,
+        sz: BigDecimal
+    ): Result<String> {
+        val mgnMode = resolveMarginMode()
+        val body = buildJsonObject {
+            put("instId", JsonPrimitive(instId))
+            put("tdMode", JsonPrimitive(mgnMode))
+            put("side", JsonPrimitive(side))
+            put("ordType", JsonPrimitive("conditional"))
+            put("sz", JsonPrimitive(sz.toPlainString()))
+            put("tpTriggerPx", JsonPrimitive(formatPrice(triggerPrice)))
+            put("tpOrdPx", JsonPrimitive("-1"))
+            put("reduceOnly", JsonPrimitive(true))
+            posSide?.let { put("posSide", JsonPrimitive(it)) }
+        }.toString()
+        logger.debug { "OKX TP algo request: $body" }
+
+        val response = httpClient.executeSignedPost(OkxConstants.Endpoints.ORDER_ALGO, body)
+            ?: return Result.failure(OkxException("No response from API"))
+        logger.debug { "OKX TP algo response: $response" }
+
+        val error = parseError(response)
+        if (error != null) {
+            logger.error { "OKX TP algo failed: ${error.message}. Response: $response" }
+            return Result.failure(error)
+        }
+
+        val obj = json.parseToJsonElement(response).jsonObject
+        val data = obj["data"]?.jsonArray ?: JsonArray(emptyList())
+        val first = data.firstOrNull()?.jsonObject
+        val sCode = first?.get("sCode")?.jsonPrimitive?.content
+        if (sCode != null && sCode != "0") {
+            val sMsg = first?.get("sMsg")?.jsonPrimitive?.content ?: "Unknown error"
+            logger.error { "OKX TP algo rejected: sCode=$sCode sMsg=$sMsg" }
+            return Result.failure(OkxApiException(sCode.toIntOrNull() ?: -1, sMsg))
+        }
+
+        val algoId = first?.get("algoId")?.jsonPrimitive?.content ?: ""
+        logger.info { "OKX TP algo placed: algoId=$algoId triggerPrice=$triggerPrice sz=$sz" }
+        return Result.success(algoId)
     }
 
     private suspend fun placeTrailingStopAlgo(

@@ -1,6 +1,7 @@
 package com.cheetrader.common.exchange.bingx
 
 import com.cheetrader.common.exchange.ExchangeService
+import com.cheetrader.common.exchange.extractMultiTpParams
 import com.cheetrader.common.exchange.extractTrailingParams
 import com.cheetrader.common.exchange.formatPrice
 import com.cheetrader.common.logging.ExchangeLogger
@@ -117,21 +118,74 @@ class BingXExchangeService(
                 stopLoss = signal.stopLoss
             )
 
-            val order = BingXOrderRequest(
-                symbol = symbol,
-                side = side,
-                positionSide = positionSide,
-                type = BingXConstants.ORDER_TYPE_MARKET,
-                quantity = quantity,
-                takeProfit = safeTp?.let { TakeProfitConfig(BigDecimal.valueOf(it)) },
-                stopLoss = safeSl?.let { StopLossConfig(BigDecimal.valueOf(it)) }
-            )
+            // Check for multi-stage TP
+            val multiTp = extractMultiTpParams(signal.metadata, safeTp)
+
+            val order = if (multiTp != null) {
+                // Multi-TP: don't embed TP in main order, place separately after
+                BingXOrderRequest(
+                    symbol = symbol,
+                    side = side,
+                    positionSide = positionSide,
+                    type = BingXConstants.ORDER_TYPE_MARKET,
+                    quantity = quantity,
+                    takeProfit = null,
+                    stopLoss = safeSl?.let { StopLossConfig(BigDecimal.valueOf(it)) }
+                )
+            } else {
+                // Single TP: embed in main order (existing behavior)
+                BingXOrderRequest(
+                    symbol = symbol,
+                    side = side,
+                    positionSide = positionSide,
+                    type = BingXConstants.ORDER_TYPE_MARKET,
+                    quantity = quantity,
+                    takeProfit = safeTp?.let { TakeProfitConfig(BigDecimal.valueOf(it)) },
+                    stopLoss = safeSl?.let { StopLossConfig(BigDecimal.valueOf(it)) }
+                )
+            }
 
             val result = placeOrder(order)
 
             if (result.isSuccess) {
                 val orderData = result.getOrThrow()
                 val conditionalErrors = mutableListOf<String>()
+                val closeSide = if (isBuy) BingXConstants.SIDE_SELL else BingXConstants.SIDE_BUY
+
+                // Multi-stage take-profit orders
+                if (multiTp != null) {
+                    val precision = quantity.scale()
+                    val tp1Qty = quantity.multiply(BigDecimal.valueOf(multiTp.tp1Pct / 100.0))
+                        .setScale(precision, java.math.RoundingMode.DOWN)
+                    val tp2Qty = quantity.multiply(BigDecimal.valueOf(multiTp.tp2Pct / 100.0))
+                        .setScale(precision, java.math.RoundingMode.DOWN)
+                    val tp3Qty = quantity.subtract(tp1Qty).subtract(tp2Qty)
+
+                    if (tp1Qty > BigDecimal.ZERO && tp2Qty > BigDecimal.ZERO) {
+                        val tp1Result = placeTpAlgoOrder(symbol, closeSide, positionSide, multiTp.tp1, tp1Qty)
+                        if (tp1Result.isFailure) conditionalErrors.add("TP1: ${tp1Result.exceptionOrNull()?.message}")
+
+                        val tp2Result = placeTpAlgoOrder(symbol, closeSide, positionSide, multiTp.tp2, tp2Qty)
+                        if (tp2Result.isFailure) conditionalErrors.add("TP2: ${tp2Result.exceptionOrNull()?.message}")
+
+                        if (multiTp.tp3 != null && tp3Qty > BigDecimal.ZERO) {
+                            val tp3Result = placeTpAlgoOrder(symbol, closeSide, positionSide, multiTp.tp3, tp3Qty)
+                            if (tp3Result.isFailure) conditionalErrors.add("TP3: ${tp3Result.exceptionOrNull()?.message}")
+                        }
+                    } else {
+                        // Fallback: quantities too small, place single TP
+                        val tpResult = placeTpAlgoOrder(symbol, closeSide, positionSide, multiTp.tp1, quantity)
+                        if (tpResult.isFailure) conditionalErrors.add("TP: ${tpResult.exceptionOrNull()?.message}")
+                    }
+
+                    // TODO: Break-even after TP1/TP2 requires a PositionMonitorService that watches
+                    // for TP fill events and modifies the SL order. Metadata keys "breakEvenAfterTp1"
+                    // and "breakEvenAfterTp2" are available in signal.metadata for this purpose.
+
+                    // TODO: Early exit based on oppositeScore requires continuous candle-by-candle
+                    // evaluation. Metadata keys "oppositeScore"/"earlyExitScoreThreshold" in
+                    // signal.metadata are snapshots at signal time.
+                }
 
                 // Trailing stop from metadata
                 val trailingParams = extractTrailingParams(signal.metadata)
@@ -347,6 +401,40 @@ class BingXExchangeService(
         }
 
         return Result.failure(BingXException("Max retries exceeded"))
+    }
+
+    private suspend fun placeTpAlgoOrder(
+        symbol: String,
+        side: String,
+        positionSide: String,
+        stopPrice: Double,
+        quantity: BigDecimal
+    ): Result<String> {
+        val params = mutableMapOf(
+            "symbol" to symbol,
+            "side" to side,
+            "positionSide" to positionSide,
+            "type" to BingXConstants.ORDER_TYPE_TAKE_PROFIT_MARKET,
+            "quantity" to quantity.toPlainString(),
+            "stopPrice" to formatPrice(stopPrice),
+            "workingType" to BingXConstants.WORKING_TYPE_MARK_PRICE
+        )
+
+        val response = httpClient.executeSignedPost(BingXConstants.Endpoints.TRADE_ORDER, params)
+            ?: return Result.failure(BingXException("No response from API"))
+
+        val jsonResponse = json.parseToJsonElement(response).jsonObject
+        val code = jsonResponse["code"]?.jsonPrimitive?.intOrNull
+
+        if (code == BingXConstants.ErrorCodes.SUCCESS) {
+            val orderId = jsonResponse["data"]?.jsonObject?.get("orderId")?.jsonPrimitive?.content ?: ""
+            logger.info { "BingX TP algo placed: orderId=$orderId stopPrice=$stopPrice qty=$quantity" }
+            return Result.success(orderId)
+        } else {
+            val msg = jsonResponse["msg"]?.jsonPrimitive?.content ?: "Unknown error"
+            logger.error { "BingX TP algo failed: [$code] $msg" }
+            return Result.failure(BingXApiException(code ?: -1, msg))
+        }
     }
 
     private suspend fun placeTrailingStopOrder(

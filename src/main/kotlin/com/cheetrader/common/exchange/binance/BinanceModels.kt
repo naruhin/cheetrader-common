@@ -32,6 +32,7 @@ object BinanceConstants {
         const val SET_MARGIN_TYPE = "/fapi/v1/marginType"
         const val POSITION_SIDE_DUAL = "/fapi/v1/positionSide/dual"
         const val TICKER_PRICE = "/fapi/v1/ticker/price"
+        const val PREMIUM_INDEX = "/fapi/v1/premiumIndex"
     }
 }
 

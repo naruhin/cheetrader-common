@@ -1,6 +1,7 @@
 package com.cheetrader.common.exchange.bybit
 
 import com.cheetrader.common.exchange.ExchangeService
+import com.cheetrader.common.exchange.extractMultiTpParams
 import com.cheetrader.common.exchange.extractTrailingParams
 import com.cheetrader.common.exchange.formatPrice
 import com.cheetrader.common.logging.ExchangeLogger
@@ -110,27 +111,33 @@ class BybitExchangeService(
                 stopLoss = signal.stopLoss
             )
 
+            // Check for multi-stage TP
+            val multiTp = extractMultiTpParams(signal.metadata, safeTp)
             val trailingParams = extractTrailingParams(signal.metadata)
 
+            val orderTp = if (multiTp != null) null else safeTp
+
+            var usedIdx = desiredIdx
             var orderResult = placeOrder(
                 symbol = symbol,
                 side = side,
                 quantity = quantity,
                 positionIdx = desiredIdx,
                 reduceOnly = false,
-                takeProfit = safeTp,
+                takeProfit = orderTp,
                 stopLoss = safeSl,
                 trailingStop = trailingParams?.let { formatPrice(it.deviation * referencePrice) }
             )
 
             if (orderResult.isFailure && desiredIdx != 0) {
+                usedIdx = 0
                 orderResult = placeOrder(
                     symbol = symbol,
                     side = side,
                     quantity = quantity,
                     positionIdx = 0,
                     reduceOnly = false,
-                    takeProfit = safeTp,
+                    takeProfit = orderTp,
                     stopLoss = safeSl,
                     trailingStop = trailingParams?.let { formatPrice(it.deviation * referencePrice) }
                 )
@@ -138,11 +145,49 @@ class BybitExchangeService(
 
             if (orderResult.isSuccess) {
                 val orderId = orderResult.getOrThrow()
+                val conditionalErrors = mutableListOf<String>()
+
+                // Multi-stage take-profit orders
+                if (multiTp != null) {
+                    val closeSide = if (isBuy) BybitConstants.SIDE_SELL else BybitConstants.SIDE_BUY
+                    val precision = quantity.scale()
+                    val tp1Qty = quantity.multiply(BigDecimal.valueOf(multiTp.tp1Pct / 100.0))
+                        .setScale(precision, RoundingMode.DOWN)
+                    val tp2Qty = quantity.multiply(BigDecimal.valueOf(multiTp.tp2Pct / 100.0))
+                        .setScale(precision, RoundingMode.DOWN)
+                    val tp3Qty = quantity.subtract(tp1Qty).subtract(tp2Qty)
+
+                    if (tp1Qty > BigDecimal.ZERO && tp2Qty > BigDecimal.ZERO) {
+                        val tp1Result = placeTpAlgoOrder(symbol, closeSide, usedIdx, isBuy, multiTp.tp1, tp1Qty)
+                        if (tp1Result.isFailure) conditionalErrors.add("TP1: ${tp1Result.exceptionOrNull()?.message}")
+
+                        val tp2Result = placeTpAlgoOrder(symbol, closeSide, usedIdx, isBuy, multiTp.tp2, tp2Qty)
+                        if (tp2Result.isFailure) conditionalErrors.add("TP2: ${tp2Result.exceptionOrNull()?.message}")
+
+                        if (multiTp.tp3 != null && tp3Qty > BigDecimal.ZERO) {
+                            val tp3Result = placeTpAlgoOrder(symbol, closeSide, usedIdx, isBuy, multiTp.tp3, tp3Qty)
+                            if (tp3Result.isFailure) conditionalErrors.add("TP3: ${tp3Result.exceptionOrNull()?.message}")
+                        }
+                    } else {
+                        // Fallback: quantities too small for splitting, use single TP
+                        val tpResult = placeTpAlgoOrder(symbol, closeSide, usedIdx, isBuy, multiTp.tp1, quantity)
+                        if (tpResult.isFailure) conditionalErrors.add("TP: ${tpResult.exceptionOrNull()?.message}")
+                    }
+                }
+
+                val status = if (conditionalErrors.isNotEmpty()) {
+                    logger.warn { "Bybit conditional order errors: $conditionalErrors" }
+                    ExecutionStatus.PARTIAL
+                } else {
+                    ExecutionStatus.SUCCESS
+                }
+
                 Result.success(
                     OrderExecution(
                         signalId = signal.id,
-                        status = ExecutionStatus.SUCCESS,
-                        exchangeOrderId = orderId
+                        status = status,
+                        exchangeOrderId = orderId,
+                        errorMessage = conditionalErrors.takeIf { it.isNotEmpty() }?.joinToString("; ")
                     )
                 )
             } else {
@@ -492,6 +537,47 @@ class BybitExchangeService(
         }
 
         return positions
+    }
+
+    private suspend fun placeTpAlgoOrder(
+        symbol: String,
+        side: String,
+        positionIdx: Int,
+        isBuy: Boolean,
+        triggerPrice: Double,
+        quantity: BigDecimal
+    ): Result<String> {
+        // triggerDirection: 1 = price rises to trigger, 2 = price falls to trigger
+        // For LONG TP: price rises → triggerDirection=1
+        // For SHORT TP: price falls → triggerDirection=2
+        val triggerDirection = if (isBuy) "1" else "2"
+        val params = mutableMapOf(
+            "category" to BybitConstants.CATEGORY_LINEAR,
+            "symbol" to symbol,
+            "side" to side,
+            "orderType" to BybitConstants.ORDER_TYPE_MARKET,
+            "qty" to quantity.toPlainString(),
+            "timeInForce" to BybitConstants.TIME_IN_FORCE_IOC,
+            "reduceOnly" to "true",
+            "positionIdx" to positionIdx.toString(),
+            "triggerPrice" to formatPrice(triggerPrice),
+            "triggerDirection" to triggerDirection,
+            "triggerBy" to BybitConstants.TRIGGER_BY_MARK_PRICE
+        )
+
+        val response = httpClient.executeSignedPost(BybitConstants.Endpoints.ORDER_CREATE, buildJsonBody(params))
+            ?: return Result.failure(BybitException("No response from API"))
+
+        val error = parseError(response)
+        if (error != null) {
+            logger.error { "Bybit TP algo failed: ${error.message}" }
+            return Result.failure(error)
+        }
+
+        val obj = json.parseToJsonElement(response).jsonObject
+        val orderId = obj["result"]?.jsonObject?.get("orderId")?.jsonPrimitive?.content ?: ""
+        logger.info { "Bybit TP algo placed: orderId=$orderId triggerPrice=$triggerPrice qty=$quantity" }
+        return Result.success(orderId)
     }
 
     private suspend fun placeOrder(

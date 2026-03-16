@@ -1,6 +1,7 @@
 package com.cheetrader.common.exchange.binance
 
 import com.cheetrader.common.exchange.ExchangeService
+import com.cheetrader.common.exchange.extractMultiTpParams
 import com.cheetrader.common.exchange.extractTrailingParams
 import com.cheetrader.common.exchange.formatPrice
 import com.cheetrader.common.logging.ExchangeLogger
@@ -147,15 +148,85 @@ class BinanceExchangeService(
 
                 val positionQty = orderData.quantity ?: quantity
 
-                safeTp?.let { tp ->
-                    val params = buildAlgoOrderParams(
-                        symbol, closeSide, positionSide,
-                        BinanceConstants.ORDER_TYPE_TAKE_PROFIT_MARKET, tp, positionQty,
-                        referencePrice
-                    )
-                    val result = placeAlgoOrder("TP", params)
-                    if (result.isFailure) {
-                        conditionalErrors.add("TP: ${result.exceptionOrNull()?.message}")
+                // Multi-stage or single take-profit
+                val multiTp = extractMultiTpParams(signal.metadata, safeTp)
+                if (multiTp != null) {
+                    val precision = positionQty.scale()
+                    val tp1Qty = positionQty.multiply(java.math.BigDecimal.valueOf(multiTp.tp1Pct / 100.0))
+                        .setScale(precision, java.math.RoundingMode.DOWN)
+                    val tp2Qty = positionQty.multiply(java.math.BigDecimal.valueOf(multiTp.tp2Pct / 100.0))
+                        .setScale(precision, java.math.RoundingMode.DOWN)
+                    val tp3Qty = positionQty.subtract(tp1Qty).subtract(tp2Qty)
+
+                    // Guard: if any partial qty is zero after rounding, fallback to single TP
+                    if (tp1Qty > java.math.BigDecimal.ZERO && tp2Qty > java.math.BigDecimal.ZERO) {
+                        // TP1
+                        val tp1Params = buildAlgoOrderParams(
+                            symbol, closeSide, positionSide,
+                            BinanceConstants.ORDER_TYPE_TAKE_PROFIT_MARKET, multiTp.tp1, tp1Qty,
+                            referencePrice
+                        )
+                        val tp1Result = placeAlgoOrder("TP1", tp1Params)
+                        if (tp1Result.isFailure) {
+                            conditionalErrors.add("TP1: ${tp1Result.exceptionOrNull()?.message}")
+                        }
+
+                        // TP2
+                        val tp2Params = buildAlgoOrderParams(
+                            symbol, closeSide, positionSide,
+                            BinanceConstants.ORDER_TYPE_TAKE_PROFIT_MARKET, multiTp.tp2, tp2Qty,
+                            referencePrice
+                        )
+                        val tp2Result = placeAlgoOrder("TP2", tp2Params)
+                        if (tp2Result.isFailure) {
+                            conditionalErrors.add("TP2: ${tp2Result.exceptionOrNull()?.message}")
+                        }
+
+                        // TP3 (if present and quantity > 0)
+                        if (multiTp.tp3 != null && tp3Qty > java.math.BigDecimal.ZERO) {
+                            val tp3Params = buildAlgoOrderParams(
+                                symbol, closeSide, positionSide,
+                                BinanceConstants.ORDER_TYPE_TAKE_PROFIT_MARKET, multiTp.tp3, tp3Qty,
+                                referencePrice
+                            )
+                            val tp3Result = placeAlgoOrder("TP3", tp3Params)
+                            if (tp3Result.isFailure) {
+                                conditionalErrors.add("TP3: ${tp3Result.exceptionOrNull()?.message}")
+                            }
+                        }
+                    } else {
+                        // Fallback: quantities too small for splitting, use single TP
+                        val params = buildAlgoOrderParams(
+                            symbol, closeSide, positionSide,
+                            BinanceConstants.ORDER_TYPE_TAKE_PROFIT_MARKET, multiTp.tp1, positionQty,
+                            referencePrice
+                        )
+                        val result = placeAlgoOrder("TP", params)
+                        if (result.isFailure) {
+                            conditionalErrors.add("TP: ${result.exceptionOrNull()?.message}")
+                        }
+                    }
+
+                    // TODO: Break-even after TP1/TP2 requires a PositionMonitorService that watches
+                    // for TP fill events and modifies the SL order. Metadata keys "breakEvenAfterTp1"
+                    // and "breakEvenAfterTp2" are available in signal.metadata for this purpose.
+
+                    // TODO: Early exit based on oppositeScore requires continuous candle-by-candle
+                    // evaluation. Metadata keys "oppositeScore"/"earlyExitScoreThreshold" in
+                    // signal.metadata are snapshots at signal time. Real early exit needs a
+                    // PositionMonitorService.
+                } else {
+                    // Single TP (existing behavior)
+                    safeTp?.let { tp ->
+                        val params = buildAlgoOrderParams(
+                            symbol, closeSide, positionSide,
+                            BinanceConstants.ORDER_TYPE_TAKE_PROFIT_MARKET, tp, positionQty,
+                            referencePrice
+                        )
+                        val result = placeAlgoOrder("TP", params)
+                        if (result.isFailure) {
+                            conditionalErrors.add("TP: ${result.exceptionOrNull()?.message}")
+                        }
                     }
                 }
 
