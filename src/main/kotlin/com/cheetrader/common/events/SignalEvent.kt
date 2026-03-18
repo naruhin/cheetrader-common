@@ -13,5 +13,7 @@ enum class SignalEventType {
     CLOSED,
     TP_HIT,
     SL_HIT,
-    CANCELLED
+    TRAILING_STOP_TRIGGERED,
+    CANCELLED,
+    KEEPALIVE
 }
