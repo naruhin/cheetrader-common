@@ -142,6 +142,7 @@ enum class SignalEventType(val displayName: String, val color: Long) {
     CLOSED("CLOSED", 0xFF60A5FA),
     TP_HIT("TP", 0xFFF59E0B),
     SL_HIT("SL", 0xFFEF4444),
+    TRAILING_STOP_TRIGGERED("TRAIL", 0xFFFBBF24),
     CANCELLED("CANCEL", 0xFF5B5B80),
     KEEPALIVE("KEEPALIVE", 0xFF5B5B80),
     UNKNOWN("UNKNOWN", 0xFF5B5B80)
