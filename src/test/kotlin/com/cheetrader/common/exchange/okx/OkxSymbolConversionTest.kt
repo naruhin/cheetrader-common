@@ -22,6 +22,9 @@ class OkxSymbolConversionTest {
         // No known quote found, returns as-is uppercase
         assertEquals("SOMETOKEN", result)
     }
+    @Test fun `convertSymbol strips 1000 prefix`() = assertEquals("BONK-USDT-SWAP", service.convertSymbol("1000BONKUSDT"))
+    @Test fun `convertSymbol strips 1000 prefix SHIB`() = assertEquals("SHIB-USDT-SWAP", service.convertSymbol("1000SHIBUSDT"))
+    @Test fun `convertSymbol strips 1000 prefix PEPE`() = assertEquals("PEPE-USDT-SWAP", service.convertSymbol("1000PEPEUSDT"))
 
     @Test fun `sanitizeTpSl valid long`() {
         val (tp, sl) = service.sanitizeTpSl(true, 65000.0, 70000.0, 60000.0)

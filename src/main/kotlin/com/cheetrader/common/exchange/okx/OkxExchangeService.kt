@@ -26,7 +26,7 @@ class OkxExchangeService(
     apiKey: String,
     secretKey: String,
     passphrase: String,
-    testnet: Boolean = false,
+    private val testnet: Boolean = false,
     private val defaultLeverage: Int = 20,
     crossMargin: Boolean = true,
     private val logger: ExchangeLogger = NoOpLogger,
@@ -133,11 +133,12 @@ class OkxExchangeService(
 
             val instrumentInfo = getInstrumentInfo(instId)
             if (instrumentInfo == null) {
+                val envLabel = if (testnet) "OKX Demo" else "OKX"
                 return Result.success(
                     OrderExecution(
                         signalId = signal.id,
                         status = ExecutionStatus.FAILED,
-                        errorMessage = "Instrument $instId not found on OKX"
+                        errorMessage = "Instrument $instId not found on $envLabel"
                     )
                 )
             }
@@ -788,7 +789,11 @@ class OkxExchangeService(
 
         val quote = listOf("USDT", "USDC").find { cleaned.endsWith(it) }
         return if (quote != null) {
-            val base = cleaned.removeSuffix(quote)
+            var base = cleaned.removeSuffix(quote)
+            // OKX doesn't use the 1000-prefix convention (e.g. 1000BONKUSDT → BONK-USDT-SWAP)
+            if (base.startsWith("1000")) {
+                base = base.removePrefix("1000")
+            }
             "$base-$quote-SWAP"
         } else {
             cleaned
