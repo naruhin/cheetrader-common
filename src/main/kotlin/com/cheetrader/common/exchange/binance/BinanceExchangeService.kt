@@ -656,7 +656,7 @@ class BinanceExchangeService(
             s.startsWith("DOGE") || s.startsWith("SHIB") || s.startsWith("PEPE") ||
             s.startsWith("FLOKI") || s.startsWith("1000") || s.startsWith("LUNC") ||
             s.startsWith("TRX") || s.startsWith("BONK") -> 0
-            else -> 1
+            else -> 0
         }
     }
 

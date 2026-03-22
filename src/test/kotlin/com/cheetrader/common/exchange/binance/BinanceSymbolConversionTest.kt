@@ -22,7 +22,7 @@ class BinanceSymbolConversionTest {
     @Test fun `quantity precision SOL`() = assertEquals(2, service.getQuantityPrecision("SOLUSDT"))
     @Test fun `quantity precision XRP`() = assertEquals(1, service.getQuantityPrecision("XRPUSDT"))
     @Test fun `quantity precision DOGE`() = assertEquals(0, service.getQuantityPrecision("DOGEUSDT"))
-    @Test fun `quantity precision unknown`() = assertEquals(1, service.getQuantityPrecision("UNKNOWNUSDT"))
+    @Test fun `quantity precision unknown`() = assertEquals(0, service.getQuantityPrecision("UNKNOWNUSDT"))
 
     @Test fun `calculateQuantity BTC`() {
         val qty = service.calculateQuantity(1000.0, 65000.0, "BTCUSDT")
