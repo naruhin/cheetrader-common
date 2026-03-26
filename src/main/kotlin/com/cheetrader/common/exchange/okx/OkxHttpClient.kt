@@ -76,7 +76,7 @@ class OkxHttpClient(
                 } else {
                     val error = conn.errorStream?.bufferedReader()?.use { it.readText() }
                     logger.error { "OKX signed GET $path failed: ${conn.responseCode} - $error" }
-                    null
+                    error
                 }
             } catch (e: Exception) {
                 logger.error(e) { "OKX signed GET $path error" }
@@ -153,7 +153,7 @@ class OkxHttpClient(
                 } else {
                     val error = conn.errorStream?.bufferedReader()?.use { it.readText() }
                     logger.error { "OKX POST $path failed: ${conn.responseCode} - $error" }
-                    null
+                    error
                 }
             } catch (e: Exception) {
                 logger.error(e) { "OKX POST $path error" }

@@ -59,6 +59,14 @@ interface ExchangeService {
      * Returns detailed position info including unrealized P&L, leverage, and margin.
      */
     suspend fun getOpenPositions(): Result<List<ExchangePosition>>
+
+    /**
+     * Get recently closed P&L records from the exchange.
+     * Used to sync dashboard when client was offline while trades closed.
+     * Default implementation returns empty list.
+     */
+    suspend fun getClosedPnl(limit: Int = 50): Result<List<ClosedPnlRecord>> =
+        Result.success(emptyList())
 }
 
 /**
@@ -74,6 +82,19 @@ data class ExchangePosition(
     val leverage: Int,
     val margin: Double,             // initial margin (USDT)
     val liquidationPrice: Double?
+)
+
+/**
+ * Closed P&L record from the exchange (realized profit/loss)
+ */
+data class ClosedPnlRecord(
+    val symbol: String,
+    val side: String,               // "LONG" or "SHORT"
+    val entryPrice: Double,
+    val exitPrice: Double,
+    val quantity: Double,
+    val closedPnl: Double,          // realized P&L in USDT
+    val closedAt: Long              // timestamp millis
 )
 
 /**
@@ -140,3 +161,23 @@ fun extractMultiTpParams(metadata: Map<String, String>, originalTp: Double?): Mu
  * Format price without scientific notation
  */
 fun formatPrice(price: Double): String = formatPricePlain(price)
+
+/**
+ * Retry a conditional order (SL/TP/trailing) up to [maxRetries] times with [delayMs] between attempts.
+ * Used after the main order succeeds — these orders are critical for risk management.
+ */
+suspend fun retryConditionalOrder(
+    maxRetries: Int = 3,
+    delayMs: Long = 1000,
+    action: suspend () -> Result<String>
+): Result<String> {
+    var lastResult: Result<String> = Result.failure(Exception("No attempts made"))
+    repeat(maxRetries) { attempt ->
+        lastResult = action()
+        if (lastResult.isSuccess) return lastResult
+        if (attempt < maxRetries - 1) {
+            kotlinx.coroutines.delay(delayMs)
+        }
+    }
+    return lastResult
+}

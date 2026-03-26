@@ -37,10 +37,12 @@ class BybitExchangeServiceTest {
 
     @Test
     fun `testConnection success`() = runTest {
-        // tryWithBaseUrls -> syncTime + getBalanceInternal (syncTime + fetchBalance)
+        // tryWithBaseUrls -> syncTime + getBalanceInternal (syncTime + fetchBalance) + getOpenPositions (syncTime + positionList)
         mock.enqueue(BybitResponses.serverTime())  // syncTime in testConnection
         mock.enqueue(BybitResponses.serverTime())  // syncTime in getBalanceInternal
         mock.enqueue(BybitResponses.balance(500.0)) // fetchBalance UNIFIED
+        mock.enqueue(BybitResponses.serverTime())  // syncTime in getOpenPositions
+        mock.enqueue(BybitResponses.positionListEmpty()) // position list check
 
         val result = service.testConnection()
         assertTrue(result.isSuccess)

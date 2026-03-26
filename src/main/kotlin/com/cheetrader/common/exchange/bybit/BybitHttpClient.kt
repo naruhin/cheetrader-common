@@ -131,7 +131,7 @@ class BybitHttpClient(
                 } else {
                     val error = conn.errorStream?.bufferedReader()?.use { it.readText() }
                     logger.error { "Bybit signed GET $path failed: ${conn.responseCode} - $error" }
-                    null
+                    error
                 }
             } catch (e: Exception) {
                 logger.error(e) { "Bybit signed GET $path error" }
@@ -173,7 +173,7 @@ class BybitHttpClient(
                 } else {
                     val error = conn.errorStream?.bufferedReader()?.use { it.readText() }
                     logger.error { "Bybit POST $path failed: ${conn.responseCode} - $error" }
-                    null
+                    error
                 }
             } catch (e: Exception) {
                 logger.error(e) { "Bybit POST $path error" }

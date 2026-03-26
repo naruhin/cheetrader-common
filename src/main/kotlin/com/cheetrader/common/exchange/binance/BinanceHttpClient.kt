@@ -112,7 +112,7 @@ class BinanceHttpClient(
                 } else {
                     val error = conn.errorStream?.bufferedReader()?.use { it.readText() }
                     logger.error { "Binance signed GET $path failed: ${conn.responseCode} - $error" }
-                    null
+                    error
                 }
             } catch (e: Exception) {
                 logger.error(e) { "Binance signed GET $path error" }
@@ -152,7 +152,7 @@ class BinanceHttpClient(
                 } else {
                     val error = conn.errorStream?.bufferedReader()?.use { it.readText() }
                     logger.error { "Binance POST $path failed: ${conn.responseCode} - $error" }
-                    null
+                    error
                 }
             } catch (e: Exception) {
                 logger.error(e) { "Binance POST $path error" }
@@ -192,7 +192,7 @@ class BinanceHttpClient(
                 } else {
                     val error = conn.errorStream?.bufferedReader()?.use { it.readText() }
                     logger.error { "Binance DELETE $path failed: ${conn.responseCode} - $error" }
-                    null
+                    error
                 }
             } catch (e: Exception) {
                 logger.error(e) { "Binance DELETE $path error" }

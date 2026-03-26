@@ -4,6 +4,7 @@ import com.cheetrader.common.exchange.ExchangePosition
 import com.cheetrader.common.exchange.ExchangeService
 import com.cheetrader.common.exchange.extractMultiTpParams
 import com.cheetrader.common.exchange.extractTrailingParams
+import com.cheetrader.common.exchange.retryConditionalOrder
 import com.cheetrader.common.exchange.formatPrice
 import com.cheetrader.common.logging.ExchangeLogger
 import com.cheetrader.common.logging.NoOpLogger
@@ -211,14 +212,16 @@ class OkxExchangeService(
                 // Trailing stop via algo order
                 val trailingParams = extractTrailingParams(signal.metadata)
                 if (trailingParams != null) {
-                    val trailingResult = placeTrailingStopAlgo(
-                        instId = instId,
-                        side = closeSide,
-                        posSide = posSide,
-                        sz = quantity,
-                        callbackRatio = trailingParams.deviation,
-                        activePx = trailingParams.triggerPrice
-                    )
+                    val trailingResult = retryConditionalOrder {
+                        placeTrailingStopAlgo(
+                            instId = instId,
+                            side = closeSide,
+                            posSide = posSide,
+                            sz = quantity,
+                            callbackRatio = trailingParams.deviation,
+                            activePx = trailingParams.triggerPrice
+                        )
+                    }
                     if (trailingResult.isFailure) {
                         conditionalErrors.add("Trailing: ${trailingResult.exceptionOrNull()?.message}")
                     }

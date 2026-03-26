@@ -16,7 +16,7 @@ object BybitConstants {
         const val SERVER_TIME = "/v5/market/time"
         const val WALLET_BALANCE = "/v5/account/wallet-balance"
         const val SET_LEVERAGE = "/v5/position/set-leverage"
-        const val POSITION_MODE = "/v5/position/position-mode"
+        const val ACCOUNT_INFO = "/v5/account/info"
         const val POSITION_LIST = "/v5/position/list"
         const val ORDER_CREATE = "/v5/order/create"
         const val CANCEL_ALL_ORDERS = "/v5/order/cancel-all"

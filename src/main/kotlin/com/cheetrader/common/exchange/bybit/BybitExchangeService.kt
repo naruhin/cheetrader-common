@@ -1,5 +1,6 @@
 package com.cheetrader.common.exchange.bybit
 
+import com.cheetrader.common.exchange.ClosedPnlRecord
 import com.cheetrader.common.exchange.ExchangePosition
 import com.cheetrader.common.exchange.ExchangeService
 import com.cheetrader.common.exchange.extractMultiTpParams
@@ -57,12 +58,25 @@ class BybitExchangeService(
         return tryWithBaseUrls {
             httpClient.syncTime()
             val balance = getBalanceInternal()
-            if (balance.isSuccess) {
-                logger.info { "Bybit connection OK. Balance: ${balance.getOrNull()}" }
-                Result.success(true)
-            } else {
-                Result.failure(balance.exceptionOrNull() ?: Exception("Connection failed"))
+            if (balance.isFailure) {
+                return@tryWithBaseUrls Result.failure(
+                    balance.exceptionOrNull() ?: Exception("Connection failed")
+                )
             }
+
+            // Also verify position endpoint works (different permissions)
+            val positionResult = getOpenPositions()
+            if (positionResult.isFailure) {
+                val err = positionResult.exceptionOrNull()
+                logger.error { "Bybit position endpoint failed: ${err?.message}" }
+                return@tryWithBaseUrls Result.failure(
+                    BybitException("Balance OK but position endpoint failed: ${err?.message}. " +
+                            "Check API key permissions (Trade/Position required).")
+                )
+            }
+
+            logger.info { "Bybit connection OK. Balance: ${balance.getOrNull()}" }
+            Result.success(true)
         }
     }
 
@@ -387,9 +401,12 @@ class BybitExchangeService(
         return tryWithBaseUrls {
             try {
                 httpClient.syncTime()
-                val params = mutableMapOf("category" to BybitConstants.CATEGORY_LINEAR)
+                val params = mutableMapOf(
+                    "category" to BybitConstants.CATEGORY_LINEAR,
+                    "settleCoin" to "USDT"
+                )
                 val response = httpClient.executeSignedGet(BybitConstants.Endpoints.POSITION_LIST, params)
-                    ?: return@tryWithBaseUrls Result.success(emptyList())
+                    ?: return@tryWithBaseUrls Result.failure(BybitException("No response from position list API"))
 
                 val error = parseError(response)
                 if (error != null) return@tryWithBaseUrls Result.failure(error)
@@ -476,7 +493,7 @@ class BybitExchangeService(
         return try {
             val response = httpClient.executeSignedGet(
                 BybitConstants.Endpoints.POSITION_LIST,
-                mapOf("category" to BybitConstants.CATEGORY_LINEAR, "limit" to "10")
+                mapOf("category" to BybitConstants.CATEGORY_LINEAR, "settleCoin" to "USDT", "limit" to "10")
             ) ?: return detectFromPositionModeEndpoint()
 
             val error = parseError(response)
@@ -504,8 +521,8 @@ class BybitExchangeService(
     private suspend fun detectFromPositionModeEndpoint(): Int {
         return try {
             val response = httpClient.executeSignedGet(
-                BybitConstants.Endpoints.POSITION_MODE,
-                mapOf("category" to BybitConstants.CATEGORY_LINEAR)
+                BybitConstants.Endpoints.ACCOUNT_INFO,
+                emptyMap()
             ) ?: return 0
 
             val error = parseError(response)
@@ -513,9 +530,9 @@ class BybitExchangeService(
 
             val obj = json.parseToJsonElement(response).jsonObject
             val result = obj["result"]?.jsonObject
-            val mode = result?.get("mode")?.jsonPrimitive?.intOrNull
-                ?: result?.get("positionMode")?.jsonPrimitive?.intOrNull
-                ?: 0
+            // unifiedMarginStatus: 1=regular, 3=unified, 4=UTA Pro
+            // positionMode: 0=one-way, 3=hedge
+            val mode = result?.get("positionMode")?.jsonPrimitive?.intOrNull ?: 0
 
             cachedPositionMode = mode
             positionModeCachedAt = System.currentTimeMillis()
@@ -533,7 +550,10 @@ class BybitExchangeService(
     )
 
     private suspend fun getPositions(symbol: String?): List<BybitPosition> {
-        val params = mutableMapOf("category" to BybitConstants.CATEGORY_LINEAR)
+        val params = mutableMapOf(
+            "category" to BybitConstants.CATEGORY_LINEAR,
+            "settleCoin" to "USDT"
+        )
         symbol?.let { params["symbol"] = it }
 
         val response = httpClient.executeSignedGet(BybitConstants.Endpoints.POSITION_LIST, params)
@@ -728,17 +748,20 @@ class BybitExchangeService(
     }
 
     internal fun getQuantityPrecision(symbol: String): Int {
+        // Bybit-specific qtyStep values (different from Binance!)
         val s = symbol.uppercase()
         return when {
-            s.startsWith("BTC") -> 3
-            s.startsWith("ETH") -> 3
-            s.startsWith("BNB") || s.startsWith("SOL") || s.startsWith("LTC") -> 2
+            s.startsWith("BTC") -> 3    // qtyStep=0.001
+            s.startsWith("ETH") -> 2    // qtyStep=0.01 (Binance=0.001)
+            s.startsWith("BNB") || s.startsWith("LTC") -> 2  // qtyStep=0.01
+            s.startsWith("SOL") -> 1    // qtyStep=0.1 (Binance=0.01)
             s.startsWith("XRP") || s.startsWith("ADA") || s.startsWith("DOT") ||
-            s.startsWith("AVAX") || s.startsWith("LINK") || s.startsWith("NEAR") ||
-            s.startsWith("ATOM") || s.startsWith("FIL") || s.startsWith("APT") ||
+            s.startsWith("AVAX") || s.startsWith("NEAR") ||
+            s.startsWith("FIL") || s.startsWith("APT") ||
             s.startsWith("ARB") || s.startsWith("OP") || s.startsWith("SUI") ||
-            s.startsWith("MATIC") || s.startsWith("POL") || s.startsWith("ETC") ||
-            s.startsWith("UNI") || s.startsWith("AAVE") || s.startsWith("INJ") -> 1
+            s.startsWith("MATIC") || s.startsWith("POL") || s.startsWith("ETC") -> 1
+            s.startsWith("LINK") || s.startsWith("ATOM") ||
+            s.startsWith("UNI") || s.startsWith("AAVE") || s.startsWith("INJ") -> 2  // qtyStep=0.01
             s.startsWith("DOGE") || s.startsWith("SHIB") || s.startsWith("PEPE") ||
             s.startsWith("FLOKI") || s.startsWith("1000") || s.startsWith("LUNC") ||
             s.startsWith("TRX") || s.startsWith("BONK") -> 0
@@ -752,6 +775,44 @@ class BybitExchangeService(
             cleaned = cleaned.removeSuffix("-SWAP")
         }
         return cleaned.replace("-", "")
+    }
+
+    override suspend fun getClosedPnl(limit: Int): Result<List<ClosedPnlRecord>> {
+        return tryWithBaseUrls {
+            try {
+                httpClient.syncTime()
+                val params = mutableMapOf(
+                    "category" to BybitConstants.CATEGORY_LINEAR,
+                    "limit" to limit.coerceIn(1, 100).toString()
+                )
+                val response = httpClient.executeSignedGet("/v5/position/closed-pnl", params)
+                    ?: return@tryWithBaseUrls Result.success(emptyList())
+
+                val error = parseError(response)
+                if (error != null) return@tryWithBaseUrls Result.failure(error)
+
+                val obj = json.parseToJsonElement(response).jsonObject
+                val list = obj["result"]?.jsonObject?.get("list")?.jsonArray ?: JsonArray(emptyList())
+                val records = list.mapNotNull { item ->
+                    val rec = item.jsonObject
+                    val closedPnl = rec["closedPnl"]?.jsonPrimitive?.content?.toDoubleOrNull() ?: return@mapNotNull null
+                    val side = rec["side"]?.jsonPrimitive?.content ?: return@mapNotNull null
+                    ClosedPnlRecord(
+                        symbol = rec["symbol"]?.jsonPrimitive?.content ?: return@mapNotNull null,
+                        side = if (side == BybitConstants.SIDE_BUY) "LONG" else "SHORT",
+                        entryPrice = rec["avgEntryPrice"]?.jsonPrimitive?.content?.toDoubleOrNull() ?: 0.0,
+                        exitPrice = rec["avgExitPrice"]?.jsonPrimitive?.content?.toDoubleOrNull() ?: 0.0,
+                        quantity = rec["qty"]?.jsonPrimitive?.content?.toDoubleOrNull() ?: 0.0,
+                        closedPnl = closedPnl,
+                        closedAt = rec["updatedTime"]?.jsonPrimitive?.content?.toLongOrNull() ?: 0L
+                    )
+                }
+                Result.success(records)
+            } catch (e: Exception) {
+                logger.error(e) { "Bybit get closed PnL failed" }
+                Result.failure(e)
+            }
+        }
     }
 
     private fun parseError(response: String): BybitApiException? {

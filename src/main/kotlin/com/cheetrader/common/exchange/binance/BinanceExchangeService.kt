@@ -1,10 +1,12 @@
 package com.cheetrader.common.exchange.binance
 
+import com.cheetrader.common.exchange.ClosedPnlRecord
 import com.cheetrader.common.exchange.ExchangePosition
 import com.cheetrader.common.exchange.ExchangeService
 import com.cheetrader.common.exchange.extractMultiTpParams
 import com.cheetrader.common.exchange.extractTrailingParams
 import com.cheetrader.common.exchange.formatPrice
+import com.cheetrader.common.exchange.retryConditionalOrder
 import com.cheetrader.common.logging.ExchangeLogger
 import com.cheetrader.common.logging.NoOpLogger
 import com.cheetrader.common.model.ExecutionStatus
@@ -232,12 +234,14 @@ class BinanceExchangeService(
                 }
 
                 safeSl?.let { sl ->
-                    val params = buildAlgoOrderParams(
-                        symbol, closeSide, positionSide,
-                        BinanceConstants.ORDER_TYPE_STOP_MARKET, sl, positionQty,
-                        referencePrice
-                    )
-                    val result = placeAlgoOrder("SL", params)
+                    val result = retryConditionalOrder {
+                        val params = buildAlgoOrderParams(
+                            symbol, closeSide, positionSide,
+                            BinanceConstants.ORDER_TYPE_STOP_MARKET, sl, positionQty,
+                            referencePrice
+                        )
+                        placeAlgoOrder("SL", params)
+                    }
                     if (result.isFailure) {
                         conditionalErrors.add("SL: ${result.exceptionOrNull()?.message}")
                     }
@@ -245,21 +249,17 @@ class BinanceExchangeService(
 
                 val trailingParams = extractTrailingParams(signal.metadata)
                 trailingParams?.let { tr ->
-                    val clampedRate = (tr.deviation * 100).coerceIn(0.1, 10.0)
-                    val activatePrice = tr.triggerPrice ?: referencePrice
-                    val params = mutableMapOf(
-                        "symbol" to symbol,
-                        "side" to closeSide,
-                        "algoType" to "CONDITIONAL",
-                        "type" to BinanceConstants.ORDER_TYPE_TRAILING_STOP_MARKET,
-                        "quantity" to positionQty.toPlainString(),
-                        "callbackRate" to formatPrice(clampedRate),
-                        "activatePrice" to roundTriggerPrice(activatePrice, referencePrice),
-                        "workingType" to BinanceConstants.WORKING_TYPE_MARK_PRICE
-                    )
-                    if (positionSide != null) params["positionSide"] = positionSide
-                    else params["reduceOnly"] = "true"
-                    val result = placeAlgoOrder("Trailing", params)
+                    val result = retryConditionalOrder {
+                        placeTrailingStopOrder(
+                            symbol = symbol,
+                            side = closeSide,
+                            positionSide = positionSide,
+                            quantity = positionQty,
+                            callbackRate = tr.deviation * 100,
+                            activatePrice = tr.triggerPrice ?: referencePrice,
+                            referencePrice = referencePrice
+                        )
+                    }
                     if (result.isFailure) {
                         conditionalErrors.add("Trailing: ${result.exceptionOrNull()?.message}")
                     }
@@ -543,6 +543,52 @@ class BinanceExchangeService(
         }
     }
 
+    private suspend fun placeTrailingStopOrder(
+        symbol: String,
+        side: String,
+        positionSide: String?,
+        quantity: BigDecimal,
+        callbackRate: Double,
+        activatePrice: Double,
+        referencePrice: Double
+    ): Result<String> {
+        // Binance requires callbackRate between 0.1 and 5.0, with max 1 decimal place
+        val clampedRate = callbackRate.coerceIn(0.1, 5.0)
+        val roundedRate = BigDecimal.valueOf(clampedRate)
+            .setScale(1, RoundingMode.HALF_UP)
+            .toPlainString()
+        val params = mutableMapOf(
+            "symbol" to symbol,
+            "side" to side,
+            "type" to BinanceConstants.ORDER_TYPE_TRAILING_STOP_MARKET,
+            "quantity" to quantity.toPlainString(),
+            "callbackRate" to roundedRate,
+            "activationPrice" to roundTriggerPrice(activatePrice, referencePrice),
+            "workingType" to BinanceConstants.WORKING_TYPE_MARK_PRICE
+        )
+        if (positionSide != null) params["positionSide"] = positionSide
+        else params["reduceOnly"] = "true"
+
+        val response = httpClient.executeSignedPost(BinanceConstants.Endpoints.PLACE_ORDER, params)
+            ?: return Result.failure(BinanceException("No response from API"))
+
+        val error = parseError(response)
+        if (error != null) {
+            logger.error { "Binance trailing stop failed: ${error.message}" }
+            return Result.failure(error)
+        }
+
+        return try {
+            val obj = json.parseToJsonElement(response).jsonObject
+            val orderId = obj["orderId"]?.jsonPrimitive?.content ?: ""
+            logger.info { "Binance trailing stop placed: orderId=$orderId callbackRate=$roundedRate" }
+            Result.success(orderId)
+        } catch (e: Exception) {
+            logger.error(e) { "Binance trailing stop response parse error. Response: $response" }
+            Result.failure(e)
+        }
+    }
+
     private suspend fun setupPosition(symbol: String) {
         try {
             val marginParams = mutableMapOf(
@@ -630,6 +676,41 @@ class BinanceExchangeService(
                 ?: return Result.failure(BinanceException("Cannot parse price"))
             Result.success(price)
         } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    override suspend fun getClosedPnl(limit: Int): Result<List<ClosedPnlRecord>> {
+        return try {
+            httpClient.syncTime()
+            val params = mutableMapOf(
+                "incomeType" to "REALIZED_PNL",
+                "limit" to limit.coerceIn(1, 1000).toString()
+            )
+            val response = httpClient.executeSignedGet("/fapi/v1/income", params)
+                ?: return Result.success(emptyList())
+
+            val array = json.parseToJsonElement(response) as? JsonArray
+                ?: return Result.success(emptyList())
+
+            val records = array.mapNotNull { item ->
+                val obj = item.jsonObject
+                val income = obj["income"]?.jsonPrimitive?.content?.toDoubleOrNull() ?: return@mapNotNull null
+                val symbol = obj["symbol"]?.jsonPrimitive?.content ?: return@mapNotNull null
+                val time = obj["time"]?.jsonPrimitive?.content?.toLongOrNull() ?: 0L
+                ClosedPnlRecord(
+                    symbol = symbol,
+                    side = "",  // Binance income API doesn't include side
+                    entryPrice = 0.0,
+                    exitPrice = 0.0,
+                    quantity = 0.0,
+                    closedPnl = income,
+                    closedAt = time
+                )
+            }
+            Result.success(records)
+        } catch (e: Exception) {
+            logger.error(e) { "Binance get closed PnL failed" }
             Result.failure(e)
         }
     }

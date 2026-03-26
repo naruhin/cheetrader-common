@@ -4,6 +4,7 @@ import com.cheetrader.common.exchange.ExchangePosition
 import com.cheetrader.common.exchange.ExchangeService
 import com.cheetrader.common.exchange.extractMultiTpParams
 import com.cheetrader.common.exchange.extractTrailingParams
+import com.cheetrader.common.exchange.retryConditionalOrder
 import com.cheetrader.common.exchange.formatPrice
 import com.cheetrader.common.logging.ExchangeLogger
 import com.cheetrader.common.logging.NoOpLogger
@@ -191,13 +192,15 @@ class BingXExchangeService(
                 // Trailing stop from metadata
                 val trailingParams = extractTrailingParams(signal.metadata)
                 if (trailingParams != null) {
-                    val trailingResult = placeTrailingStopOrder(
-                        symbol = symbol,
-                        side = if (isBuy) BingXConstants.SIDE_SELL else BingXConstants.SIDE_BUY,
-                        positionSide = positionSide,
-                        callbackRate = trailingParams.deviation * 100, // API expects percentage
-                        activationPrice = trailingParams.triggerPrice
-                    )
+                    val trailingResult = retryConditionalOrder {
+                        placeTrailingStopOrder(
+                            symbol = symbol,
+                            side = if (isBuy) BingXConstants.SIDE_SELL else BingXConstants.SIDE_BUY,
+                            positionSide = positionSide,
+                            callbackRate = trailingParams.deviation * 100,
+                            activationPrice = trailingParams.triggerPrice
+                        )
+                    }
                     if (trailingResult.isFailure) {
                         conditionalErrors.add("Trailing: ${trailingResult.exceptionOrNull()?.message}")
                     }
