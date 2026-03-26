@@ -1,5 +1,6 @@
 package com.cheetrader.common.exchange.binance
 
+import com.cheetrader.common.exchange.ExchangePosition
 import com.cheetrader.common.exchange.ExchangeService
 import com.cheetrader.common.exchange.extractMultiTpParams
 import com.cheetrader.common.exchange.extractTrailingParams
@@ -303,10 +304,37 @@ class BinanceExchangeService(
     }
 
     override suspend fun getOpenPositionsCount(): Result<Int> {
+        return getOpenPositions().map { it.size }
+    }
+
+    override suspend fun getOpenPositions(): Result<List<ExchangePosition>> {
         return try {
             httpClient.syncTime()
-            val positions = getPositions(null)
-            Result.success(positions.size)
+            val response = httpClient.executeSignedGet(BinanceConstants.Endpoints.POSITION_RISK)
+                ?: return Result.failure(BinanceException("No response from API"))
+
+            val array = json.parseToJsonElement(response) as? JsonArray
+                ?: return Result.success(emptyList())
+
+            val result = array.mapNotNull { pos ->
+                val obj = pos.jsonObject
+                val positionAmt = obj["positionAmt"]?.jsonPrimitive?.content?.toDoubleOrNull() ?: 0.0
+                if (positionAmt == 0.0) return@mapNotNull null
+
+                ExchangePosition(
+                    symbol = obj["symbol"]?.jsonPrimitive?.content ?: return@mapNotNull null,
+                    side = if (positionAmt > 0) "LONG" else "SHORT",
+                    size = kotlin.math.abs(positionAmt),
+                    entryPrice = obj["entryPrice"]?.jsonPrimitive?.content?.toDoubleOrNull() ?: 0.0,
+                    markPrice = obj["markPrice"]?.jsonPrimitive?.content?.toDoubleOrNull() ?: 0.0,
+                    unrealizedPnl = obj["unRealizedProfit"]?.jsonPrimitive?.content?.toDoubleOrNull() ?: 0.0,
+                    leverage = obj["leverage"]?.jsonPrimitive?.content?.toIntOrNull() ?: 1,
+                    margin = obj["isolatedMargin"]?.jsonPrimitive?.content?.toDoubleOrNull()
+                        ?: obj["initialMargin"]?.jsonPrimitive?.content?.toDoubleOrNull() ?: 0.0,
+                    liquidationPrice = obj["liquidationPrice"]?.jsonPrimitive?.content?.toDoubleOrNull()
+                )
+            }
+            Result.success(result)
         } catch (e: Exception) {
             logger.error(e) { "Binance get positions failed" }
             Result.failure(e)

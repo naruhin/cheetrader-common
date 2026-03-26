@@ -1,5 +1,6 @@
 package com.cheetrader.common.exchange.bybit
 
+import com.cheetrader.common.exchange.ExchangePosition
 import com.cheetrader.common.exchange.ExchangeService
 import com.cheetrader.common.exchange.extractMultiTpParams
 import com.cheetrader.common.exchange.extractTrailingParams
@@ -379,11 +380,42 @@ class BybitExchangeService(
     }
 
     override suspend fun getOpenPositionsCount(): Result<Int> {
+        return getOpenPositions().map { it.size }
+    }
+
+    override suspend fun getOpenPositions(): Result<List<ExchangePosition>> {
         return tryWithBaseUrls {
             try {
                 httpClient.syncTime()
-                val positions = getPositions(null)
-                Result.success(positions.size)
+                val params = mutableMapOf("category" to BybitConstants.CATEGORY_LINEAR)
+                val response = httpClient.executeSignedGet(BybitConstants.Endpoints.POSITION_LIST, params)
+                    ?: return@tryWithBaseUrls Result.success(emptyList())
+
+                val error = parseError(response)
+                if (error != null) return@tryWithBaseUrls Result.failure(error)
+
+                val obj = json.parseToJsonElement(response).jsonObject
+                val list = obj["result"]?.jsonObject?.get("list")?.jsonArray ?: JsonArray(emptyList())
+                val result = list.mapNotNull { item ->
+                    val pos = item.jsonObject
+                    val size = pos["size"]?.jsonPrimitive?.content?.toDoubleOrNull() ?: 0.0
+                    if (size == 0.0) return@mapNotNull null
+
+                    val side = pos["side"]?.jsonPrimitive?.content ?: return@mapNotNull null
+
+                    ExchangePosition(
+                        symbol = pos["symbol"]?.jsonPrimitive?.content ?: return@mapNotNull null,
+                        side = if (side == BybitConstants.SIDE_BUY) "LONG" else "SHORT",
+                        size = kotlin.math.abs(size),
+                        entryPrice = pos["avgPrice"]?.jsonPrimitive?.content?.toDoubleOrNull() ?: 0.0,
+                        markPrice = pos["markPrice"]?.jsonPrimitive?.content?.toDoubleOrNull() ?: 0.0,
+                        unrealizedPnl = pos["unrealisedPnl"]?.jsonPrimitive?.content?.toDoubleOrNull() ?: 0.0,
+                        leverage = pos["leverage"]?.jsonPrimitive?.content?.toDoubleOrNull()?.toInt() ?: 1,
+                        margin = pos["positionIM"]?.jsonPrimitive?.content?.toDoubleOrNull() ?: 0.0,
+                        liquidationPrice = pos["liqPrice"]?.jsonPrimitive?.content?.toDoubleOrNull()
+                    )
+                }
+                Result.success(result)
             } catch (e: Exception) {
                 logger.error(e) { "Bybit get positions failed" }
                 Result.failure(e)

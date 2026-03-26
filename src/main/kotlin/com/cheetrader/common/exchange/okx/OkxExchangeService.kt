@@ -1,5 +1,6 @@
 package com.cheetrader.common.exchange.okx
 
+import com.cheetrader.common.exchange.ExchangePosition
 import com.cheetrader.common.exchange.ExchangeService
 import com.cheetrader.common.exchange.extractMultiTpParams
 import com.cheetrader.common.exchange.extractTrailingParams
@@ -328,9 +329,46 @@ class OkxExchangeService(
     }
 
     override suspend fun getOpenPositionsCount(): Result<Int> {
+        return getOpenPositions().map { it.size }
+    }
+
+    override suspend fun getOpenPositions(): Result<List<ExchangePosition>> {
         return try {
-            val positions = getPositions(null)
-            Result.success(positions.size)
+            val params = mapOf("instType" to "SWAP")
+            val response = httpClient.executeSignedGet(OkxConstants.Endpoints.ACCOUNT_POSITIONS, params)
+                ?: return Result.success(emptyList())
+
+            val error = parseError(response)
+            if (error != null) return Result.failure(error)
+
+            val obj = json.parseToJsonElement(response).jsonObject
+            val data = obj["data"]?.jsonArray ?: JsonArray(emptyList())
+            val result = data.mapNotNull { item ->
+                val pos = item.jsonObject
+                val posSize = pos["pos"]?.jsonPrimitive?.content?.toDoubleOrNull() ?: 0.0
+                if (posSize == 0.0) return@mapNotNull null
+
+                val posSide = pos["posSide"]?.jsonPrimitive?.content ?: "net"
+                val side = when {
+                    posSide == "long" -> "LONG"
+                    posSide == "short" -> "SHORT"
+                    posSize > 0 -> "LONG"
+                    else -> "SHORT"
+                }
+
+                ExchangePosition(
+                    symbol = pos["instId"]?.jsonPrimitive?.content ?: return@mapNotNull null,
+                    side = side,
+                    size = kotlin.math.abs(posSize),
+                    entryPrice = pos["avgPx"]?.jsonPrimitive?.content?.toDoubleOrNull() ?: 0.0,
+                    markPrice = pos["markPx"]?.jsonPrimitive?.content?.toDoubleOrNull() ?: 0.0,
+                    unrealizedPnl = pos["upl"]?.jsonPrimitive?.content?.toDoubleOrNull() ?: 0.0,
+                    leverage = pos["lever"]?.jsonPrimitive?.content?.toDoubleOrNull()?.toInt() ?: 1,
+                    margin = pos["margin"]?.jsonPrimitive?.content?.toDoubleOrNull() ?: 0.0,
+                    liquidationPrice = pos["liqPx"]?.jsonPrimitive?.content?.toDoubleOrNull()
+                )
+            }
+            Result.success(result)
         } catch (e: Exception) {
             logger.error(e) { "OKX get positions failed" }
             Result.failure(e)

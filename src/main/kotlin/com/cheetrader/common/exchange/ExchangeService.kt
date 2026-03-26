@@ -53,7 +53,28 @@ interface ExchangeService {
      * Get current market price for a symbol
      */
     suspend fun getMarketPrice(symbol: String): Result<Double>
+
+    /**
+     * Get open positions with P&L data from the exchange.
+     * Returns detailed position info including unrealized P&L, leverage, and margin.
+     */
+    suspend fun getOpenPositions(): Result<List<ExchangePosition>>
 }
+
+/**
+ * Exchange position with P&L data as reported by the exchange
+ */
+data class ExchangePosition(
+    val symbol: String,
+    val side: String,               // "LONG" or "SHORT"
+    val size: Double,               // position size (contracts/coins)
+    val entryPrice: Double,
+    val markPrice: Double,
+    val unrealizedPnl: Double,      // in USDT
+    val leverage: Int,
+    val margin: Double,             // initial margin (USDT)
+    val liquidationPrice: Double?
+)
 
 /**
  * Exchange order result data
@@ -80,8 +101,9 @@ data class TrailingStopParams(
  * Extract trailing stop parameters from signal metadata
  */
 fun extractTrailingParams(metadata: Map<String, String>): TrailingStopParams? {
-    val active = metadata["trailingActive"]?.toBooleanStrictOrNull() ?: false
-    if (!active) return null
+    // Note: do NOT check "trailingActive" here — it's a server-side runtime state
+    // (always "false" at signal creation). The exchange uses activationPrice/triggerPrice
+    // to handle activation natively.
     val deviation = metadata["trailingDeviation"]?.toDoubleOrNull() ?: return null
     if (deviation <= 0) return null
     val trigger = metadata["triggerPrice"]?.toDoubleOrNull()

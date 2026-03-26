@@ -1,5 +1,6 @@
 package com.cheetrader.common.exchange.bingx
 
+import com.cheetrader.common.exchange.ExchangePosition
 import com.cheetrader.common.exchange.ExchangeService
 import com.cheetrader.common.exchange.extractMultiTpParams
 import com.cheetrader.common.exchange.extractTrailingParams
@@ -326,6 +327,10 @@ class BingXExchangeService(
     }
 
     override suspend fun getOpenPositionsCount(): Result<Int> {
+        return getOpenPositions().map { it.size }
+    }
+
+    override suspend fun getOpenPositions(): Result<List<ExchangePosition>> {
         return try {
             httpClient.syncTime()
             val positionsResponse = httpClient.executeSignedGet(BingXConstants.Endpoints.GET_POSITIONS)
@@ -336,12 +341,25 @@ class BingXExchangeService(
 
             if (code == BingXConstants.ErrorCodes.SUCCESS) {
                 val positions = jsonResponse["data"]?.jsonArray ?: JsonArray(emptyList())
-                val count = positions.count { position ->
+                val result = positions.mapNotNull { position ->
                     val posObj = position.jsonObject
                     val positionAmt = posObj["positionAmt"]?.jsonPrimitive?.content?.toDoubleOrNull() ?: 0.0
-                    positionAmt != 0.0
+                    if (positionAmt == 0.0) return@mapNotNull null
+
+                    ExchangePosition(
+                        symbol = posObj["symbol"]?.jsonPrimitive?.content ?: return@mapNotNull null,
+                        side = if (positionAmt > 0) "LONG" else "SHORT",
+                        size = kotlin.math.abs(positionAmt),
+                        entryPrice = posObj["avgPrice"]?.jsonPrimitive?.content?.toDoubleOrNull() ?: 0.0,
+                        markPrice = posObj["markPrice"]?.jsonPrimitive?.content?.toDoubleOrNull() ?: 0.0,
+                        unrealizedPnl = posObj["unrealizedProfit"]?.jsonPrimitive?.content?.toDoubleOrNull() ?: 0.0,
+                        leverage = posObj["leverage"]?.jsonPrimitive?.content?.toIntOrNull() ?: 1,
+                        margin = posObj["initialMargin"]?.jsonPrimitive?.content?.toDoubleOrNull()
+                            ?: posObj["margin"]?.jsonPrimitive?.content?.toDoubleOrNull() ?: 0.0,
+                        liquidationPrice = posObj["liquidationPrice"]?.jsonPrimitive?.content?.toDoubleOrNull()
+                    )
                 }
-                Result.success(count)
+                Result.success(result)
             } else {
                 val msg = jsonResponse["msg"]?.jsonPrimitive?.content ?: "Unknown error"
                 Result.failure(BingXApiException(code ?: -1, msg))
