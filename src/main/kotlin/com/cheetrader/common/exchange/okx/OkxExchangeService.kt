@@ -381,37 +381,87 @@ class OkxExchangeService(
     override suspend fun cancelAllOrders(symbol: String): Result<Unit> {
         return try {
             val instId = convertSymbol(symbol)
+
+            // Cancel regular orders
             val pending = getPendingOrders(instId)
-            if (pending.isEmpty()) {
-                return Result.success(Unit)
-            }
+            if (pending.isNotEmpty()) {
+                val chunks = pending.chunked(20)
+                for (chunk in chunks) {
+                    val body = buildJsonArray {
+                        chunk.forEach { ordId ->
+                            add(
+                                buildJsonObject {
+                                    put("instId", JsonPrimitive(instId))
+                                    put("ordId", JsonPrimitive(ordId))
+                                }
+                            )
+                        }
+                    }.toString()
 
-            val chunks = pending.chunked(20)
-            for (chunk in chunks) {
-                val body = buildJsonArray {
-                    chunk.forEach { ordId ->
-                        add(
-                            buildJsonObject {
-                                put("instId", JsonPrimitive(instId))
-                                put("ordId", JsonPrimitive(ordId))
-                            }
-                        )
+                    val response = httpClient.executeSignedPost(OkxConstants.Endpoints.CANCEL_BATCH, body)
+                        ?: return Result.failure(OkxException("No response from API"))
+
+                    val error = parseError(response)
+                    if (error != null) {
+                        return Result.failure(error)
                     }
-                }.toString()
-
-                val response = httpClient.executeSignedPost(OkxConstants.Endpoints.CANCEL_BATCH, body)
-                    ?: return Result.failure(OkxException("No response from API"))
-
-                val error = parseError(response)
-                if (error != null) {
-                    return Result.failure(error)
                 }
             }
+
+            // Cancel algo orders (TP, SL, trailing stop)
+            cancelAlgoOrders(instId)
 
             Result.success(Unit)
         } catch (e: Exception) {
             logger.error(e) { "OKX cancel all orders failed: $symbol" }
             Result.failure(e)
+        }
+    }
+
+    private suspend fun cancelAlgoOrders(instId: String) {
+        try {
+            val algoIds = getPendingAlgoOrders(instId)
+            if (algoIds.isEmpty()) return
+
+            val chunks = algoIds.chunked(20)
+            for (chunk in chunks) {
+                val body = buildJsonArray {
+                    chunk.forEach { algoId ->
+                        add(
+                            buildJsonObject {
+                                put("instId", JsonPrimitive(instId))
+                                put("algoId", JsonPrimitive(algoId))
+                            }
+                        )
+                    }
+                }.toString()
+
+                val response = httpClient.executeSignedPost(OkxConstants.Endpoints.CANCEL_ALGOS, body)
+                if (response != null) {
+                    val error = parseError(response)
+                    if (error != null) {
+                        logger.warn { "OKX cancel algo orders warning: ${error.message}" }
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            logger.warn { "OKX cancel algo orders warning: ${e.message}" }
+        }
+    }
+
+    private suspend fun getPendingAlgoOrders(instId: String): List<String> {
+        val response = httpClient.executeSignedGet(
+            OkxConstants.Endpoints.ORDERS_ALGO_PENDING,
+            mapOf("instId" to instId, "ordType" to "conditional,move_order_stop")
+        ) ?: return emptyList()
+
+        val error = parseError(response)
+        if (error != null) return emptyList()
+
+        val obj = json.parseToJsonElement(response).jsonObject
+        val data = obj["data"]?.jsonArray ?: JsonArray(emptyList())
+        return data.mapNotNull { item ->
+            item.jsonObject["algoId"]?.jsonPrimitive?.content
         }
     }
 
@@ -743,7 +793,25 @@ class OkxExchangeService(
         )
         posSide?.let { params["posSide"] = it }
         val body = buildJsonBody(params)
-        httpClient.executeSignedPost(OkxConstants.Endpoints.CLOSE_POSITION, body)
+        val response = httpClient.executeSignedPost(OkxConstants.Endpoints.CLOSE_POSITION, body)
+            ?: throw OkxException("No response from OKX close position API")
+
+        val error = parseError(response)
+        if (error != null) {
+            throw error
+        }
+
+        // Also check per-order sCode inside data[]
+        val obj = json.parseToJsonElement(response).jsonObject
+        val data = obj["data"]?.jsonArray ?: JsonArray(emptyList())
+        val first = data.firstOrNull()?.jsonObject
+        val sCode = first?.get("sCode")?.jsonPrimitive?.content
+        if (sCode != null && sCode != "0") {
+            val sMsg = first?.get("sMsg")?.jsonPrimitive?.content ?: "Unknown error"
+            throw OkxApiException(sCode.toIntOrNull() ?: -1, sMsg)
+        }
+
+        logger.info { "OKX position closed: instId=$instId posSide=$posSide" }
     }
 
     private suspend fun getPendingOrders(instId: String): List<String> {

@@ -6,6 +6,7 @@ import com.cheetrader.common.exchange.ExchangeService
 import com.cheetrader.common.exchange.extractMultiTpParams
 import com.cheetrader.common.exchange.extractTrailingParams
 import com.cheetrader.common.exchange.formatPrice
+import com.cheetrader.common.exchange.retryConditionalOrder
 import com.cheetrader.common.logging.ExchangeLogger
 import com.cheetrader.common.logging.NoOpLogger
 import com.cheetrader.common.model.ExecutionStatus
@@ -140,8 +141,7 @@ class BybitExchangeService(
                 positionIdx = desiredIdx,
                 reduceOnly = false,
                 takeProfit = orderTp,
-                stopLoss = safeSl,
-                trailingStop = trailingParams?.let { formatPrice(it.deviation * referencePrice) }
+                stopLoss = safeSl
             )
 
             if (orderResult.isFailure && desiredIdx != 0) {
@@ -153,14 +153,28 @@ class BybitExchangeService(
                     positionIdx = 0,
                     reduceOnly = false,
                     takeProfit = orderTp,
-                    stopLoss = safeSl,
-                    trailingStop = trailingParams?.let { formatPrice(it.deviation * referencePrice) }
+                    stopLoss = safeSl
                 )
             }
 
             if (orderResult.isSuccess) {
                 val orderId = orderResult.getOrThrow()
                 val conditionalErrors = mutableListOf<String>()
+
+                // Trailing stop via /v5/position/trading-stop (create order doesn't support it)
+                if (trailingParams != null) {
+                    val trailingResult = retryConditionalOrder {
+                        setTradingStop(
+                            symbol = symbol,
+                            positionIdx = usedIdx,
+                            trailingStop = trailingParams.deviation * referencePrice,
+                            activePrice = trailingParams.triggerPrice
+                        )
+                    }
+                    if (trailingResult.isFailure) {
+                        conditionalErrors.add("Trailing: ${trailingResult.exceptionOrNull()?.message}")
+                    }
+                }
 
                 // Multi-stage take-profit orders
                 if (multiTp != null) {
@@ -383,13 +397,45 @@ class BybitExchangeService(
 
             val error = parseError(response)
             if (error != null) {
-                Result.failure(error)
-            } else {
-                Result.success(Unit)
+                return Result.failure(error)
             }
+
+            // Reset trailing stop (set via /v5/position/trading-stop, not cancelled by cancel-all)
+            resetTrailingStop(targetSymbol)
+
+            Result.success(Unit)
         } catch (e: Exception) {
             logger.error(e) { "Bybit cancel all orders failed: $symbol" }
             Result.failure(e)
+        }
+    }
+
+    private suspend fun resetTrailingStop(symbol: String) {
+        try {
+            val positions = getPositions(symbol)
+            for (position in positions) {
+                val params = mapOf(
+                    "category" to BybitConstants.CATEGORY_LINEAR,
+                    "symbol" to symbol,
+                    "tpslMode" to BybitConstants.TPSL_MODE_FULL,
+                    "positionIdx" to position.positionIdx.toString(),
+                    "trailingStop" to "0",
+                    "stopLoss" to "0",
+                    "takeProfit" to "0"
+                )
+                val response = httpClient.executeSignedPost(
+                    BybitConstants.Endpoints.TRADING_STOP,
+                    buildJsonBody(params)
+                )
+                if (response != null) {
+                    val error = parseError(response)
+                    if (error != null) {
+                        logger.warn { "Bybit reset trailing stop warning: ${error.message}" }
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            logger.warn { "Bybit reset trailing stop warning: ${e.message}" }
         }
     }
 
@@ -639,8 +685,7 @@ class BybitExchangeService(
         positionIdx: Int,
         reduceOnly: Boolean,
         takeProfit: Double?,
-        stopLoss: Double?,
-        trailingStop: String? = null
+        stopLoss: Double?
     ): Result<String> {
         val params = mutableMapOf(
             "category" to BybitConstants.CATEGORY_LINEAR,
@@ -665,9 +710,6 @@ class BybitExchangeService(
                 params["stopLoss"] = formatPrice(it)
                 params["slTriggerBy"] = BybitConstants.TRIGGER_BY_MARK_PRICE
             }
-            trailingStop?.let {
-                params["trailingStop"] = it
-            }
         }
 
         val response = httpClient.executeSignedPost(BybitConstants.Endpoints.ORDER_CREATE, buildJsonBody(params))
@@ -681,6 +723,34 @@ class BybitExchangeService(
         val obj = json.parseToJsonElement(response).jsonObject
         val orderId = obj["result"]?.jsonObject?.get("orderId")?.jsonPrimitive?.content
         return Result.success(orderId ?: "")
+    }
+
+    private suspend fun setTradingStop(
+        symbol: String,
+        positionIdx: Int,
+        trailingStop: Double,
+        activePrice: Double?
+    ): Result<String> {
+        val params = mutableMapOf(
+            "category" to BybitConstants.CATEGORY_LINEAR,
+            "symbol" to symbol,
+            "tpslMode" to BybitConstants.TPSL_MODE_FULL,
+            "positionIdx" to positionIdx.toString(),
+            "trailingStop" to formatPrice(trailingStop)
+        )
+        activePrice?.let { params["activePrice"] = formatPrice(it) }
+
+        val response = httpClient.executeSignedPost(BybitConstants.Endpoints.TRADING_STOP, buildJsonBody(params))
+            ?: return Result.failure(BybitException("No response from API"))
+
+        val error = parseError(response)
+        if (error != null) {
+            logger.error { "Bybit trailing stop failed: ${error.message}" }
+            return Result.failure(error)
+        }
+
+        logger.info { "Bybit trailing stop set: symbol=$symbol trailingStop=$trailingStop" }
+        return Result.success("ok")
     }
 
     override suspend fun getMarketPrice(symbol: String): Result<Double> {

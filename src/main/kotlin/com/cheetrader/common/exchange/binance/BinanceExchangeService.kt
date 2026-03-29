@@ -45,9 +45,13 @@ class BinanceExchangeService(
     private val httpClient = BinanceHttpClient(apiKey, secretKey, baseUrl, logger)
     private val json = Json { ignoreUnknownKeys = true }
 
+    @Volatile
+    private var precisionCache: Map<String, Int> = emptyMap()
+
     override suspend fun testConnection(): Result<Boolean> {
         return try {
             httpClient.syncTime()
+            loadExchangeInfo()
             val balance = getBalance()
             if (balance.isSuccess) {
                 logger.info { "Binance connection OK. Balance: ${balance.getOrNull()}" }
@@ -96,6 +100,7 @@ class BinanceExchangeService(
     override suspend fun executeSignal(signal: Signal, balancePercent: Double): Result<OrderExecution> {
         return try {
             httpClient.syncTime()
+            if (precisionCache.isEmpty()) loadExchangeInfo()
 
             val balanceResult = getBalance()
             if (balanceResult.isFailure) {
@@ -427,15 +432,32 @@ class BinanceExchangeService(
             httpClient.syncTime()
             val targetSymbol = convertSymbol(symbol)
             val params = mutableMapOf("symbol" to targetSymbol)
+
+            // Cancel regular orders
             val response = httpClient.executeSignedDelete(BinanceConstants.Endpoints.CANCEL_ALL_ORDERS, params)
                 ?: return Result.failure(BinanceException("No response from API"))
-
             val error = parseError(response)
             if (error != null) {
-                Result.failure(error)
-            } else {
-                Result.success(Unit)
+                return Result.failure(error)
             }
+
+            // Cancel algo orders (TP, SL, trailing stop)
+            try {
+                val algoResponse = httpClient.executeSignedDelete(
+                    BinanceConstants.Endpoints.CANCEL_ALL_ALGO_ORDERS,
+                    mutableMapOf("symbol" to targetSymbol)
+                )
+                if (algoResponse != null) {
+                    val algoError = parseError(algoResponse)
+                    if (algoError != null) {
+                        logger.warn { "Binance cancel algo orders warning: ${algoError.message}" }
+                    }
+                }
+            } catch (e: Exception) {
+                logger.warn { "Binance cancel algo orders warning: ${e.message}" }
+            }
+
+            Result.success(Unit)
         } catch (e: Exception) {
             logger.error(e) { "Binance cancel all orders failed: $symbol" }
             Result.failure(e)
@@ -560,6 +582,7 @@ class BinanceExchangeService(
         val params = mutableMapOf(
             "symbol" to symbol,
             "side" to side,
+            "algoType" to "CONDITIONAL",
             "type" to BinanceConstants.ORDER_TYPE_TRAILING_STOP_MARKET,
             "quantity" to quantity.toPlainString(),
             "callbackRate" to roundedRate,
@@ -569,24 +592,36 @@ class BinanceExchangeService(
         if (positionSide != null) params["positionSide"] = positionSide
         else params["reduceOnly"] = "true"
 
-        val response = httpClient.executeSignedPost(BinanceConstants.Endpoints.PLACE_ORDER, params)
-            ?: return Result.failure(BinanceException("No response from API"))
+        return placeAlgoOrder("trailing stop (cb=$roundedRate)", params)
+    }
 
-        val error = parseError(response)
-        if (error != null) {
-            logger.error { "Binance trailing stop failed: ${error.message}" }
-            return Result.failure(error)
-        }
-
-        return try {
+    suspend fun loadExchangeInfo() {
+        try {
+            val response = httpClient.executeGet(BinanceConstants.Endpoints.EXCHANGE_INFO)
+                ?: return
             val obj = json.parseToJsonElement(response).jsonObject
-            val orderId = obj["orderId"]?.jsonPrimitive?.content ?: ""
-            logger.info { "Binance trailing stop placed: orderId=$orderId callbackRate=$roundedRate" }
-            Result.success(orderId)
+            val symbols = obj["symbols"]?.jsonArray ?: return
+            val map = mutableMapOf<String, Int>()
+            for (sym in symbols) {
+                val symObj = sym.jsonObject
+                val symbol = symObj["symbol"]?.jsonPrimitive?.content ?: continue
+                val filters = symObj["filters"]?.jsonArray ?: continue
+                val lotSize = filters.firstOrNull {
+                    it.jsonObject["filterType"]?.jsonPrimitive?.content == "LOT_SIZE"
+                }?.jsonObject ?: continue
+                val stepSize = lotSize["stepSize"]?.jsonPrimitive?.content ?: continue
+                map[symbol] = stepSizeToPrecision(stepSize)
+            }
+            precisionCache = map
+            logger.info { "Binance exchange info loaded: ${map.size} symbols" }
         } catch (e: Exception) {
-            logger.error(e) { "Binance trailing stop response parse error. Response: $response" }
-            Result.failure(e)
+            logger.warn { "Binance exchange info load failed: ${e.message}" }
         }
+    }
+
+    private fun stepSizeToPrecision(stepSize: String): Int {
+        val cleaned = stepSize.trimEnd('0')
+        return if ('.' in cleaned) cleaned.length - cleaned.indexOf('.') - 1 else 0
     }
 
     private suspend fun setupPosition(symbol: String) {
@@ -751,6 +786,7 @@ class BinanceExchangeService(
     }
 
     internal fun getQuantityPrecision(symbol: String): Int {
+        precisionCache[symbol.uppercase()]?.let { return it }
         val s = symbol.uppercase()
         return when {
             s.startsWith("BTC") -> 3

@@ -17,6 +17,8 @@ object BinanceResponses {
 
     fun leverageSuccess() = """{"leverage":20,"maxNotionalValue":"250000","symbol":"BTCUSDT"}"""
 
+    fun exchangeInfo() = """{"symbols":[{"symbol":"BTCUSDT","filters":[{"filterType":"LOT_SIZE","stepSize":"0.001"}]},{"symbol":"ETHUSDT","filters":[{"filterType":"LOT_SIZE","stepSize":"0.01"}]}]}"""
+
     fun orderSuccess(orderId: String = "123456", avgPrice: String = "65000.0", qty: String = "0.010") =
         """{"orderId":"$orderId","symbol":"BTCUSDT","side":"BUY","positionSide":"BOTH","avgPrice":"$avgPrice","executedQty":"$qty","status":"FILLED"}"""
 
@@ -64,6 +66,9 @@ object BybitResponses {
 
     fun ticker(price: Double = 65000.0) =
         """{"retCode":0,"retMsg":"OK","result":{"list":[{"lastPrice":"$price","markPrice":"$price"}]}}"""
+
+    fun tradingStopSuccess() =
+        """{"retCode":0,"retMsg":"OK","result":{}}"""
 
     fun cancelAllSuccess() =
         """{"retCode":0,"retMsg":"OK","result":{"list":[]}}"""
@@ -133,7 +138,7 @@ object BingXResponses {
         """{"code":0,"msg":"","data":[]}"""
 
     fun orderSuccess(orderId: String = "bingx-123", avgPrice: String = "65000.0", qty: String = "0.010") =
-        """{"code":0,"msg":"","data":{"orderId":"$orderId","symbol":"BTC-USDT","side":"BUY","positionSide":"LONG","type":"MARKET","origQty":"$qty","avgPrice":"$avgPrice","status":"FILLED"}}"""
+        """{"code":0,"msg":"","data":{"order":{"orderId":"$orderId","symbol":"BTC-USDT","side":"BUY","positionSide":"LONG","type":"MARKET","origQty":"$qty","avgPrice":"$avgPrice","status":"FILLED"}}}"""
 
     fun positions(symbol: String = "BTC-USDT", amt: Double = 0.010) =
         """{"code":0,"msg":"","data":[{"symbol":"$symbol","positionAmt":"$amt"}]}"""

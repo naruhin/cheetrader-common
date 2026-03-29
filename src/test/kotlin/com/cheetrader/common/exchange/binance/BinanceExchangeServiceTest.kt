@@ -37,8 +37,9 @@ class BinanceExchangeServiceTest {
 
     @Test
     fun `testConnection success`() = runTest {
-        // syncTime for testConnection + syncTime for getBalance + balance
+        // syncTime, loadExchangeInfo, syncTime (getBalance), balance
         mock.enqueue(BinanceResponses.serverTime())
+        mock.enqueue(BinanceResponses.exchangeInfo())
         mock.enqueue(BinanceResponses.serverTime())
         mock.enqueue(BinanceResponses.balance(500.0))
 
@@ -50,6 +51,7 @@ class BinanceExchangeServiceTest {
     @Test
     fun `testConnection balance failure`() = runTest {
         mock.enqueue(BinanceResponses.serverTime())
+        mock.enqueue(BinanceResponses.exchangeInfo())
         mock.enqueue(BinanceResponses.serverTime())
         mock.enqueue(BinanceResponses.apiError(-2015, "Invalid API-key"))
 
@@ -93,9 +95,10 @@ class BinanceExchangeServiceTest {
     fun `executeSignal LONG full flow success`() = runTest {
         val signal = TestSignals.longBtc(tp = 70000.0, sl = 60000.0)
 
-        // syncTime, syncTime+balance (getBalance), positionSideDual, marginType, leverage,
-        // tickerPrice (getMarketPrice), order, algoTP, algoSL
+        // syncTime, exchangeInfo, syncTime+balance (getBalance), positionSideDual,
+        // marginType, leverage, tickerPrice, order, algoTP, algoSL
         mock.enqueue(BinanceResponses.serverTime())            // syncTime in executeSignal
+        mock.enqueue(BinanceResponses.exchangeInfo())          // loadExchangeInfo
         mock.enqueue(BinanceResponses.serverTime())            // syncTime in getBalance
         mock.enqueue(BinanceResponses.balance(1000.0))         // balance
         mock.enqueue(BinanceResponses.positionSideDual(false)) // positionSideMode
@@ -118,6 +121,7 @@ class BinanceExchangeServiceTest {
         val signal = TestSignals.shortEth(tp = 3000.0, sl = 3800.0)
 
         mock.enqueue(BinanceResponses.serverTime())
+        mock.enqueue(BinanceResponses.exchangeInfo())
         mock.enqueue(BinanceResponses.serverTime())
         mock.enqueue(BinanceResponses.balance(1000.0))
         mock.enqueue(BinanceResponses.positionSideDual(false))
@@ -138,6 +142,7 @@ class BinanceExchangeServiceTest {
         val signal = TestSignals.longBtc()
 
         mock.enqueue(BinanceResponses.serverTime())
+        mock.enqueue(BinanceResponses.exchangeInfo())
         mock.enqueue(BinanceResponses.serverTime())
         mock.enqueue(BinanceResponses.apiError(-2015, "Invalid key"))
 
@@ -150,6 +155,7 @@ class BinanceExchangeServiceTest {
         val signal = TestSignals.longBtc()
 
         mock.enqueue(BinanceResponses.serverTime())
+        mock.enqueue(BinanceResponses.exchangeInfo())
         mock.enqueue(BinanceResponses.serverTime())
         mock.enqueue(BinanceResponses.balance(1000.0))
         mock.enqueue(BinanceResponses.positionSideDual(false))
@@ -168,6 +174,7 @@ class BinanceExchangeServiceTest {
         val signal = TestSignals.longBtc(tp = 70000.0, sl = 60000.0)
 
         mock.enqueue(BinanceResponses.serverTime())
+        mock.enqueue(BinanceResponses.exchangeInfo())
         mock.enqueue(BinanceResponses.serverTime())
         mock.enqueue(BinanceResponses.balance(1000.0))
         mock.enqueue(BinanceResponses.positionSideDual(false))
@@ -188,6 +195,7 @@ class BinanceExchangeServiceTest {
         val signal = TestSignals.longBtc(tp = null, sl = null)
 
         mock.enqueue(BinanceResponses.serverTime())
+        mock.enqueue(BinanceResponses.exchangeInfo())
         mock.enqueue(BinanceResponses.serverTime())
         mock.enqueue(BinanceResponses.balance(1000.0))
         mock.enqueue(BinanceResponses.positionSideDual(false))
@@ -210,6 +218,7 @@ class BinanceExchangeServiceTest {
         )
 
         mock.enqueue(BinanceResponses.serverTime())
+        mock.enqueue(BinanceResponses.exchangeInfo())
         mock.enqueue(BinanceResponses.serverTime())
         mock.enqueue(BinanceResponses.balance(1000.0))
         mock.enqueue(BinanceResponses.positionSideDual(false))
@@ -231,6 +240,7 @@ class BinanceExchangeServiceTest {
         val signal = TestSignals.longBtc(tp = 70000.0, sl = 60000.0)
 
         mock.enqueue(BinanceResponses.serverTime())
+        mock.enqueue(BinanceResponses.exchangeInfo())
         mock.enqueue(BinanceResponses.serverTime())
         mock.enqueue(BinanceResponses.balance(1000.0))
         mock.enqueue(BinanceResponses.positionSideDual(true)) // dual mode

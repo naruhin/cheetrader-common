@@ -19,6 +19,7 @@ object BybitConstants {
         const val ACCOUNT_INFO = "/v5/account/info"
         const val POSITION_LIST = "/v5/position/list"
         const val ORDER_CREATE = "/v5/order/create"
+        const val TRADING_STOP = "/v5/position/trading-stop"
         const val CANCEL_ALL_ORDERS = "/v5/order/cancel-all"
     }
 }

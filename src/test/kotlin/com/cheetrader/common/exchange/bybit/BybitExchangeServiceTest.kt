@@ -263,6 +263,54 @@ class BybitExchangeServiceTest {
     // ===== getMarketPrice =====
 
     @Test
+    fun `executeSignal with trailing stop`() = runTest {
+        val signal = TestSignals.longBtc(
+            tp = 70000.0,
+            sl = 60000.0,
+            metadata = TestSignals.withTrailingStop(deviation = 0.01, triggerPrice = 66000.0)
+        )
+
+        mock.enqueue(BybitResponses.serverTime())  // syncTime
+        mock.enqueue(BybitResponses.serverTime())  // syncTime in getBalance
+        mock.enqueue(BybitResponses.balance(1000.0))
+        mock.enqueue(BybitResponses.leverageSuccess())
+        mock.enqueue(BybitResponses.positionListEmpty())
+        mock.enqueue(BybitResponses.ticker(65000.0))
+        mock.enqueue(BybitResponses.orderSuccess("bybit-trail-1"))
+        mock.enqueue(BybitResponses.tradingStopSuccess()) // trailing stop via /v5/position/trading-stop
+
+        val result = service.executeSignal(signal, 5.0)
+        assertTrue(result.isSuccess)
+        val exec = result.getOrThrow()
+        assertEquals(ExecutionStatus.SUCCESS, exec.status)
+        assertEquals("bybit-trail-1", exec.exchangeOrderId)
+    }
+
+    @Test
+    fun `executeSignal trailing stop fails returns PARTIAL`() = runTest {
+        val signal = TestSignals.longBtc(
+            tp = 70000.0,
+            sl = 60000.0,
+            metadata = TestSignals.withTrailingStop(deviation = 0.01, triggerPrice = 66000.0)
+        )
+
+        mock.enqueue(BybitResponses.serverTime())
+        mock.enqueue(BybitResponses.serverTime())
+        mock.enqueue(BybitResponses.balance(1000.0))
+        mock.enqueue(BybitResponses.leverageSuccess())
+        mock.enqueue(BybitResponses.positionListEmpty())
+        mock.enqueue(BybitResponses.ticker(65000.0))
+        mock.enqueue(BybitResponses.orderSuccess())
+        mock.enqueue(BybitResponses.apiError(170000, "Trailing stop error")) // trailing fails
+        mock.enqueue(BybitResponses.apiError(170000, "Trailing stop error")) // retry 1
+        mock.enqueue(BybitResponses.apiError(170000, "Trailing stop error")) // retry 2
+
+        val result = service.executeSignal(signal, 5.0)
+        assertTrue(result.isSuccess)
+        assertEquals(ExecutionStatus.PARTIAL, result.getOrThrow().status)
+    }
+
+    @Test
     fun `getMarketPrice success`() = runTest {
         mock.enqueue(BybitResponses.ticker(65432.10))
 

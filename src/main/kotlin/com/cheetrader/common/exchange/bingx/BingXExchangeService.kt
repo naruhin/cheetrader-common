@@ -20,6 +20,7 @@ import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.intOrNull
 import java.math.BigDecimal
 import java.math.RoundingMode
+import kotlinx.coroutines.delay
 import java.net.URLEncoder
 import java.nio.charset.StandardCharsets
 
@@ -197,7 +198,8 @@ class BingXExchangeService(
                             symbol = symbol,
                             side = if (isBuy) BingXConstants.SIDE_SELL else BingXConstants.SIDE_BUY,
                             positionSide = positionSide,
-                            callbackRate = trailingParams.deviation * 100,
+                            quantity = quantity,
+                            priceRate = trailingParams.deviation * 100,
                             activationPrice = trailingParams.triggerPrice
                         )
                     }
@@ -392,15 +394,18 @@ class BingXExchangeService(
                 when (code) {
                     BingXConstants.ErrorCodes.SUCCESS -> {
                         val data = jsonResponse["data"]?.jsonObject
+                        // BingX V2 API nests the order object under data.order; fall back to flat data for compatibility
+                        val orderObj = data?.get("order")?.jsonObject ?: data
                         val orderData = BingXOrderData(
-                            orderId = data?.get("orderId")?.jsonPrimitive?.content,
-                            symbol = data?.get("symbol")?.jsonPrimitive?.content,
-                            side = data?.get("side")?.jsonPrimitive?.content,
-                            positionSide = data?.get("positionSide")?.jsonPrimitive?.content,
-                            type = data?.get("type")?.jsonPrimitive?.content,
-                            quantity = data?.get("origQty")?.jsonPrimitive?.content,
-                            price = data?.get("avgPrice")?.jsonPrimitive?.content,
-                            status = data?.get("status")?.jsonPrimitive?.content
+                            orderId = orderObj?.get("orderId")?.jsonPrimitive?.content,
+                            symbol = orderObj?.get("symbol")?.jsonPrimitive?.content,
+                            side = orderObj?.get("side")?.jsonPrimitive?.content,
+                            positionSide = orderObj?.get("positionSide")?.jsonPrimitive?.content,
+                            type = orderObj?.get("type")?.jsonPrimitive?.content,
+                            quantity = orderObj?.get("origQty")?.jsonPrimitive?.content
+                                ?: orderObj?.get("executedQty")?.jsonPrimitive?.content,
+                            price = orderObj?.get("avgPrice")?.jsonPrimitive?.content,
+                            status = orderObj?.get("status")?.jsonPrimitive?.content
                         )
                         logger.info { "Order placed: ${orderData.orderId}" }
                         return Result.success(orderData)
@@ -408,7 +413,7 @@ class BingXExchangeService(
                     BingXConstants.ErrorCodes.TIMESTAMP_ERROR -> {
                         logger.warn { "Attempt ${attempt + 1}: Timestamp error, syncing time..." }
                         httpClient.syncTime()
-                        Thread.sleep(1000)
+                        delay(1000)
                     }
                     else -> {
                         val msg = jsonResponse["msg"]?.jsonPrimitive?.content ?: "Unknown error"
@@ -417,7 +422,7 @@ class BingXExchangeService(
                 }
             } catch (e: Exception) {
                 logger.error(e) { "Attempt ${attempt + 1}: Exception placing order" }
-                if (attempt < maxRetries - 1) Thread.sleep(1000)
+                if (attempt < maxRetries - 1) delay(1000)
             }
         }
 
@@ -462,19 +467,19 @@ class BingXExchangeService(
         symbol: String,
         side: String,
         positionSide: String,
-        callbackRate: Double,
+        quantity: BigDecimal,
+        priceRate: Double,        // percentage value: 1.0 = 1% (BingX valid range: 0.1–5.0)
         activationPrice: Double?
     ): Result<String> {
-        // BingX callbackRate: percentage value (e.g. 1.0 for 1%)
-        val clampedRate = callbackRate.coerceIn(0.1, 5.0)
+        val clampedRate = priceRate.coerceIn(0.1, 5.0)
 
         val params = mutableMapOf(
             "symbol" to symbol,
             "side" to side,
             "positionSide" to positionSide,
             "type" to BingXConstants.ORDER_TYPE_TRAILING_STOP_MARKET,
-            "quantity" to "0", // close entire position
-            "callbackRate" to formatPrice(clampedRate),
+            "quantity" to quantity.toPlainString(),
+            "priceRate" to formatPrice(clampedRate),
             "workingType" to BingXConstants.WORKING_TYPE_MARK_PRICE
         )
 
@@ -487,8 +492,10 @@ class BingXExchangeService(
         val code = jsonResponse["code"]?.jsonPrimitive?.intOrNull
 
         if (code == BingXConstants.ErrorCodes.SUCCESS) {
-            val orderId = jsonResponse["data"]?.jsonObject?.get("orderId")?.jsonPrimitive?.content ?: ""
-            logger.info { "BingX trailing stop placed: orderId=$orderId callbackRate=$clampedRate%" }
+            val data = jsonResponse["data"]?.jsonObject
+            val orderObj = data?.get("order")?.jsonObject ?: data
+            val orderId = orderObj?.get("orderId")?.jsonPrimitive?.content ?: ""
+            logger.info { "BingX trailing stop placed: orderId=$orderId priceRate=${clampedRate * 100}% (raw=$clampedRate)" }
             return Result.success(orderId)
         } else {
             val msg = jsonResponse["msg"]?.jsonPrimitive?.content ?: "Unknown error"
