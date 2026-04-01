@@ -163,14 +163,13 @@ class BybitExchangeService(
 
                 // Trailing stop via /v5/position/trading-stop (create order doesn't support it)
                 if (trailingParams != null) {
-                    val trailingResult = retryConditionalOrder {
-                        setTradingStop(
-                            symbol = symbol,
-                            positionIdx = usedIdx,
-                            trailingStop = trailingParams.deviation * referencePrice,
-                            activePrice = trailingParams.triggerPrice
-                        )
-                    }
+                    val trailingResult = setTradingStopWithRecalc(
+                        symbol = symbol,
+                        positionIdx = usedIdx,
+                        trailingStop = trailingParams.deviation * referencePrice,
+                        activePrice = trailingParams.triggerPrice,
+                        isBuy = isBuy
+                    )
                     if (trailingResult.isFailure) {
                         conditionalErrors.add("Trailing: ${trailingResult.exceptionOrNull()?.message}")
                     }
@@ -751,6 +750,34 @@ class BybitExchangeService(
 
         logger.info { "Bybit trailing stop set: symbol=$symbol trailingStop=$trailingStop" }
         return Result.success("ok")
+    }
+
+    private suspend fun setTradingStopWithRecalc(
+        symbol: String,
+        positionIdx: Int,
+        trailingStop: Double,
+        activePrice: Double?,
+        isBuy: Boolean
+    ): Result<String> {
+        // Attempt 1: original activePrice
+        val result1 = setTradingStop(symbol, positionIdx, trailingStop, activePrice)
+        if (result1.isSuccess) return result1
+
+        // Attempt 2: recalculate activePrice from current market price
+        logger.warn { "Bybit trailing failed, recalculating activePrice from market price..." }
+        kotlinx.coroutines.delay(500)
+        val marketPrice = getMarketPrice(symbol).getOrNull()
+        if (marketPrice != null) {
+            val offset = marketPrice * 0.001
+            val recalculated = if (isBuy) marketPrice + offset else marketPrice - offset
+            val result2 = setTradingStop(symbol, positionIdx, trailingStop, recalculated)
+            if (result2.isSuccess) return result2
+        }
+
+        // Attempt 3: no activePrice — activate immediately
+        logger.warn { "Bybit trailing recalc still rejected, placing without activePrice" }
+        kotlinx.coroutines.delay(500)
+        return setTradingStop(symbol, positionIdx, trailingStop, null)
     }
 
     override suspend fun getMarketPrice(symbol: String): Result<Double> {

@@ -212,16 +212,15 @@ class OkxExchangeService(
                 // Trailing stop via algo order
                 val trailingParams = extractTrailingParams(signal.metadata)
                 if (trailingParams != null) {
-                    val trailingResult = retryConditionalOrder {
-                        placeTrailingStopAlgo(
-                            instId = instId,
-                            side = closeSide,
-                            posSide = posSide,
-                            sz = quantity,
-                            callbackRatio = trailingParams.deviation,
-                            activePx = trailingParams.triggerPrice
-                        )
-                    }
+                    val trailingResult = placeTrailingStopAlgoWithRecalc(
+                        instId = instId,
+                        side = closeSide,
+                        posSide = posSide,
+                        sz = quantity,
+                        callbackRatio = trailingParams.deviation,
+                        activePx = trailingParams.triggerPrice,
+                        isBuy = isBuy
+                    )
                     if (trailingResult.isFailure) {
                         conditionalErrors.add("Trailing: ${trailingResult.exceptionOrNull()?.message}")
                     }
@@ -652,6 +651,36 @@ class OkxExchangeService(
         val algoId = first?.get("algoId")?.jsonPrimitive?.content ?: ""
         logger.info { "OKX trailing stop placed: algoId=$algoId callbackRatio=$callbackRatio activePx=$activePx" }
         return Result.success(algoId)
+    }
+
+    private suspend fun placeTrailingStopAlgoWithRecalc(
+        instId: String,
+        side: String,
+        posSide: String?,
+        sz: BigDecimal,
+        callbackRatio: Double,
+        activePx: Double?,
+        isBuy: Boolean
+    ): Result<String> {
+        // Attempt 1: original activePx
+        val result1 = placeTrailingStopAlgo(instId, side, posSide, sz, callbackRatio, activePx)
+        if (result1.isSuccess) return result1
+
+        // Attempt 2: recalculate activePx from current market price
+        logger.warn { "OKX trailing failed, recalculating activePx from market price..." }
+        kotlinx.coroutines.delay(500)
+        val marketPrice = getMarketPrice(instId).getOrNull()
+        if (marketPrice != null) {
+            val offset = marketPrice * 0.001
+            val recalculated = if (isBuy) marketPrice + offset else marketPrice - offset
+            val result2 = placeTrailingStopAlgo(instId, side, posSide, sz, callbackRatio, recalculated)
+            if (result2.isSuccess) return result2
+        }
+
+        // Attempt 3: no activePx — activate immediately
+        logger.warn { "OKX trailing recalc still rejected, placing without activePx" }
+        kotlinx.coroutines.delay(500)
+        return placeTrailingStopAlgo(instId, side, posSide, sz, callbackRatio, null)
     }
 
     private suspend fun getAccountConfig(): AccountConfig {

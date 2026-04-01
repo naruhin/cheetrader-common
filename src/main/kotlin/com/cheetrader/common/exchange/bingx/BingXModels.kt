@@ -50,6 +50,7 @@ object BingXConstants {
         const val INSUFFICIENT_BALANCE = 100001
         const val ORDER_NOT_EXIST = 100400
         const val MARGIN_TYPE_NO_CHANGE = 110409
+        const val INVALID_ACTIVATION_PRICE = 110416
     }
 }
 

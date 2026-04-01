@@ -193,16 +193,16 @@ class BingXExchangeService(
                 // Trailing stop from metadata
                 val trailingParams = extractTrailingParams(signal.metadata)
                 if (trailingParams != null) {
-                    val trailingResult = retryConditionalOrder {
-                        placeTrailingStopOrder(
-                            symbol = symbol,
-                            side = if (isBuy) BingXConstants.SIDE_SELL else BingXConstants.SIDE_BUY,
-                            positionSide = positionSide,
-                            quantity = quantity,
-                            priceRate = trailingParams.deviation * 100,
-                            activationPrice = trailingParams.triggerPrice
-                        )
-                    }
+                    val trailingSide = if (isBuy) BingXConstants.SIDE_SELL else BingXConstants.SIDE_BUY
+                    val trailingResult = placeTrailingStopWithRecalc(
+                        symbol = symbol,
+                        side = trailingSide,
+                        positionSide = positionSide,
+                        quantity = quantity,
+                        priceRate = trailingParams.deviation * 100,
+                        activationPrice = trailingParams.triggerPrice,
+                        isBuy = isBuy
+                    )
                     if (trailingResult.isFailure) {
                         conditionalErrors.add("Trailing: ${trailingResult.exceptionOrNull()?.message}")
                     }
@@ -351,9 +351,12 @@ class BingXExchangeService(
                     val positionAmt = posObj["positionAmt"]?.jsonPrimitive?.content?.toDoubleOrNull() ?: 0.0
                     if (positionAmt == 0.0) return@mapNotNull null
 
+                    val side = posObj["positionSide"]?.jsonPrimitive?.content
+                        ?: if (positionAmt > 0) "LONG" else "SHORT"
+
                     ExchangePosition(
                         symbol = posObj["symbol"]?.jsonPrimitive?.content ?: return@mapNotNull null,
-                        side = if (positionAmt > 0) "LONG" else "SHORT",
+                        side = side,
                         size = kotlin.math.abs(positionAmt),
                         entryPrice = posObj["avgPrice"]?.jsonPrimitive?.content?.toDoubleOrNull() ?: 0.0,
                         markPrice = posObj["markPrice"]?.jsonPrimitive?.content?.toDoubleOrNull() ?: 0.0,
@@ -502,6 +505,50 @@ class BingXExchangeService(
             logger.error { "BingX trailing stop failed: [$code] $msg" }
             return Result.failure(BingXApiException(code ?: -1, msg))
         }
+    }
+
+    /**
+     * Places trailing stop with smart retry: on 110416 (activation price already breached),
+     * recalculates activationPrice from current market price. On second failure — retries without activationPrice.
+     */
+    private suspend fun placeTrailingStopWithRecalc(
+        symbol: String,
+        side: String,
+        positionSide: String,
+        quantity: BigDecimal,
+        priceRate: Double,
+        activationPrice: Double?,
+        isBuy: Boolean
+    ): Result<String> {
+        // Attempt 1: original activationPrice
+        val result1 = placeTrailingStopOrder(symbol, side, positionSide, quantity, priceRate, activationPrice)
+        if (result1.isSuccess) return result1
+
+        val ex1 = result1.exceptionOrNull()
+        if (ex1 !is BingXApiException || ex1.code != BingXConstants.ErrorCodes.INVALID_ACTIVATION_PRICE) {
+            return result1 // not a price breach error — don't retry
+        }
+
+        // Attempt 2: recalculate activationPrice from current market price
+        logger.warn { "Trailing activation price breached, recalculating from market price..." }
+        kotlinx.coroutines.delay(500)
+        val marketPrice = getMarketPrice(symbol).getOrNull()
+        if (marketPrice != null) {
+            val offset = marketPrice * 0.001 // 0.1% offset in profitable direction
+            val recalculated = if (isBuy) marketPrice + offset else marketPrice - offset
+            val result2 = placeTrailingStopOrder(symbol, side, positionSide, quantity, priceRate, recalculated)
+            if (result2.isSuccess) return result2
+
+            val ex2 = result2.exceptionOrNull()
+            if (ex2 !is BingXApiException || ex2.code != BingXConstants.ErrorCodes.INVALID_ACTIVATION_PRICE) {
+                return result2
+            }
+        }
+
+        // Attempt 3: no activationPrice — activate immediately
+        logger.warn { "Trailing recalc still rejected, placing without activationPrice (immediate activation)" }
+        kotlinx.coroutines.delay(500)
+        return placeTrailingStopOrder(symbol, side, positionSide, quantity, priceRate, null)
     }
 
     private fun buildOrderParams(order: BingXOrderRequest): MutableMap<String, String> {

@@ -140,8 +140,8 @@ object BingXResponses {
     fun orderSuccess(orderId: String = "bingx-123", avgPrice: String = "65000.0", qty: String = "0.010") =
         """{"code":0,"msg":"","data":{"order":{"orderId":"$orderId","symbol":"BTC-USDT","side":"BUY","positionSide":"LONG","type":"MARKET","origQty":"$qty","avgPrice":"$avgPrice","status":"FILLED"}}}"""
 
-    fun positions(symbol: String = "BTC-USDT", amt: Double = 0.010) =
-        """{"code":0,"msg":"","data":[{"symbol":"$symbol","positionAmt":"$amt"}]}"""
+    fun positions(symbol: String = "BTC-USDT", amt: Double = 0.010, positionSide: String = "LONG") =
+        """{"code":0,"msg":"","data":[{"symbol":"$symbol","positionAmt":"$amt","positionSide":"$positionSide"}]}"""
 
     fun positionsEmpty() =
         """{"code":0,"msg":"","data":[]}"""

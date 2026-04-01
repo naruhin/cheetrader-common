@@ -254,17 +254,16 @@ class BinanceExchangeService(
 
                 val trailingParams = extractTrailingParams(signal.metadata)
                 trailingParams?.let { tr ->
-                    val result = retryConditionalOrder {
-                        placeTrailingStopOrder(
-                            symbol = symbol,
-                            side = closeSide,
-                            positionSide = positionSide,
-                            quantity = positionQty,
-                            callbackRate = tr.deviation * 100,
-                            activatePrice = tr.triggerPrice ?: referencePrice,
-                            referencePrice = referencePrice
-                        )
-                    }
+                    val result = placeTrailingStopWithRecalc(
+                        symbol = symbol,
+                        side = closeSide,
+                        positionSide = positionSide,
+                        quantity = positionQty,
+                        callbackRate = tr.deviation * 100,
+                        activatePrice = tr.triggerPrice ?: referencePrice,
+                        referencePrice = referencePrice,
+                        isBuy = isBuy
+                    )
                     if (result.isFailure) {
                         conditionalErrors.add("Trailing: ${result.exceptionOrNull()?.message}")
                     }
@@ -326,9 +325,13 @@ class BinanceExchangeService(
                 val positionAmt = obj["positionAmt"]?.jsonPrimitive?.content?.toDoubleOrNull() ?: 0.0
                 if (positionAmt == 0.0) return@mapNotNull null
 
+                val side = obj["positionSide"]?.jsonPrimitive?.content?.let {
+                    if (it == "BOTH") null else it
+                } ?: if (positionAmt > 0) "LONG" else "SHORT"
+
                 ExchangePosition(
                     symbol = obj["symbol"]?.jsonPrimitive?.content ?: return@mapNotNull null,
-                    side = if (positionAmt > 0) "LONG" else "SHORT",
+                    side = side,
                     size = kotlin.math.abs(positionAmt),
                     entryPrice = obj["entryPrice"]?.jsonPrimitive?.content?.toDoubleOrNull() ?: 0.0,
                     markPrice = obj["markPrice"]?.jsonPrimitive?.content?.toDoubleOrNull() ?: 0.0,
@@ -593,6 +596,38 @@ class BinanceExchangeService(
         else params["reduceOnly"] = "true"
 
         return placeAlgoOrder("trailing stop (cb=$roundedRate)", params)
+    }
+
+    private suspend fun placeTrailingStopWithRecalc(
+        symbol: String,
+        side: String,
+        positionSide: String?,
+        quantity: BigDecimal,
+        callbackRate: Double,
+        activatePrice: Double,
+        referencePrice: Double,
+        isBuy: Boolean
+    ): Result<String> {
+        // Attempt 1: original activatePrice
+        val result1 = placeTrailingStopOrder(symbol, side, positionSide, quantity, callbackRate, activatePrice, referencePrice)
+        if (result1.isSuccess) return result1
+
+        // Attempt 2: recalculate from current market price
+        logger.warn { "Binance trailing failed, recalculating activatePrice from market price..." }
+        kotlinx.coroutines.delay(500)
+        val marketPrice = getMarketPrice(symbol).getOrNull()
+        if (marketPrice != null) {
+            val offset = marketPrice * 0.001
+            val recalculated = if (isBuy) marketPrice + offset else marketPrice - offset
+            val result2 = placeTrailingStopOrder(symbol, side, positionSide, quantity, callbackRate, recalculated, marketPrice)
+            if (result2.isSuccess) return result2
+        }
+
+        // Attempt 3: use current market price directly (nearest valid activation)
+        logger.warn { "Binance trailing recalc still rejected, using market price as activation" }
+        kotlinx.coroutines.delay(500)
+        val fallbackPrice = marketPrice ?: referencePrice
+        return placeTrailingStopOrder(symbol, side, positionSide, quantity, callbackRate, fallbackPrice, fallbackPrice)
     }
 
     suspend fun loadExchangeInfo() {
