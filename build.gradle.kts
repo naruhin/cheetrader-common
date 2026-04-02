@@ -4,8 +4,8 @@ plugins {
     `maven-publish`
 }
 
-group = "com.cheetrader"
-version = "0.3.2"
+group = "com.github.naruhin"
+version = project.findProperty("version") as String? ?: "0.3.2"
 
 java {
     sourceCompatibility = JavaVersion.VERSION_17
