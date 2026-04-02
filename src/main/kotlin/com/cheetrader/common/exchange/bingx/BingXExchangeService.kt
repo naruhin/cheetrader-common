@@ -471,10 +471,13 @@ class BingXExchangeService(
         side: String,
         positionSide: String,
         quantity: BigDecimal,
-        priceRate: Double,        // percentage value: 1.0 = 1% (BingX valid range: 0.1–5.0)
+        priceRate: Double,        // percentage value: 1.0 = 1% (BingX valid range: 0.1–1.0)
         activationPrice: Double?
     ): Result<String> {
-        val clampedRate = priceRate.coerceIn(0.1, 5.0)
+        if (priceRate > 1.0) {
+            logger.warn { "BingX priceRate $priceRate exceeds max 1.0 (${priceRate}%), clamping to 1.0 (1%)" }
+        }
+        val clampedRate = priceRate.coerceIn(0.1, 1.0)
 
         val params = mutableMapOf(
             "symbol" to symbol,
@@ -527,6 +530,12 @@ class BingXExchangeService(
         val ex1 = result1.exceptionOrNull()
         if (ex1 !is BingXApiException || ex1.code != BingXConstants.ErrorCodes.INVALID_ACTIVATION_PRICE) {
             return result1 // not a price breach error — don't retry
+        }
+
+        // 110416 can mean "callback rate too high" (not just activation price) — check message
+        if (ex1.message?.contains("callback rate", ignoreCase = true) == true) {
+            logger.warn { "BingX trailing stop rejected: callback rate too high for $symbol. Not retrying." }
+            return result1
         }
 
         // Attempt 2: recalculate activationPrice from current market price
