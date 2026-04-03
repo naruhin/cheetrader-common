@@ -165,6 +165,14 @@ class OkxExchangeService(
                 stopLoss = signal.stopLoss
             )
 
+            if (signal.stopLoss != null && safeSl == null) {
+                return Result.success(OrderExecution(
+                    signalId = signal.id,
+                    status = ExecutionStatus.FAILED,
+                    errorMessage = "SL ${signal.stopLoss} already breached (price=$referencePrice) — order rejected"
+                ))
+            }
+
             // Check for multi-stage TP
             val multiTp = extractMultiTpParams(signal.metadata, safeTp)
 
@@ -765,10 +773,6 @@ class OkxExchangeService(
         if (takeProfit != null && safeTp == null) {
             logger.warn { "OKX TP ignored (invalid vs price $referencePrice): $takeProfit" }
         }
-        if (stopLoss != null && safeSl == null) {
-            logger.warn { "OKX SL ignored (invalid vs price $referencePrice): $stopLoss" }
-        }
-
         return safeTp to safeSl
     }
 

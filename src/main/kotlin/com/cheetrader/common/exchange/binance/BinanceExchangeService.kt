@@ -141,6 +141,14 @@ class BinanceExchangeService(
                 stopLoss = signal.stopLoss
             )
 
+            if (signal.stopLoss != null && safeSl == null) {
+                return Result.success(OrderExecution(
+                    signalId = signal.id,
+                    status = ExecutionStatus.FAILED,
+                    errorMessage = "SL ${signal.stopLoss} already breached (price=$referencePrice) — order rejected"
+                ))
+            }
+
             val orderResult = placeOrder(
                 symbol = symbol,
                 side = side,
@@ -805,10 +813,6 @@ class BinanceExchangeService(
         if (takeProfit != null && safeTp == null) {
             logger.warn { "Binance TP ignored (invalid vs price $referencePrice): $takeProfit" }
         }
-        if (stopLoss != null && safeSl == null) {
-            logger.warn { "Binance SL ignored (invalid vs price $referencePrice): $stopLoss" }
-        }
-
         return safeTp to safeSl
     }
 
