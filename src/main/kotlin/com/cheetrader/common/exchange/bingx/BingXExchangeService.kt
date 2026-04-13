@@ -207,7 +207,7 @@ class BingXExchangeService(
                         side = trailingSide,
                         positionSide = positionSide,
                         quantity = quantity,
-                        priceRate = trailingParams.deviation * 100,
+                        priceRate = trailingParams.deviation, // decimal: 0.01 = 1%
                         activationPrice = trailingParams.triggerPrice,
                         isBuy = isBuy
                     )
@@ -479,13 +479,13 @@ class BingXExchangeService(
         side: String,
         positionSide: String,
         quantity: BigDecimal,
-        priceRate: Double,        // percentage value: 1.0 = 1% (BingX valid range: 0.1–1.0)
+        priceRate: Double,        // decimal value: 0.01 = 1% (BingX valid range: 0.001–0.1)
         activationPrice: Double?
     ): Result<String> {
-        if (priceRate > 1.0) {
-            logger.warn { "BingX priceRate $priceRate exceeds max 1.0 (${priceRate}%), clamping to 1.0 (1%)" }
+        if (priceRate > 0.1) {
+            logger.warn { "BingX priceRate $priceRate exceeds max 0.1 (10%), clamping to 0.1" }
         }
-        val clampedRate = priceRate.coerceIn(0.1, 1.0)
+        val clampedRate = priceRate.coerceIn(0.001, 0.1)
 
         val params = mutableMapOf(
             "symbol" to symbol,
@@ -509,7 +509,7 @@ class BingXExchangeService(
             val data = jsonResponse["data"]?.jsonObject
             val orderObj = data?.get("order")?.jsonObject ?: data
             val orderId = orderObj?.get("orderId")?.jsonPrimitive?.content ?: ""
-            logger.info { "BingX trailing stop placed: orderId=$orderId priceRate=${clampedRate * 100}% (raw=$clampedRate)" }
+            logger.info { "BingX trailing stop placed: orderId=$orderId priceRate=$clampedRate (${clampedRate * 100}%)" }
             return Result.success(orderId)
         } else {
             val msg = jsonResponse["msg"]?.jsonPrimitive?.content ?: "Unknown error"
