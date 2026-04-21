@@ -37,6 +37,14 @@ object BinanceResponses {
 
     fun apiError(code: Int = -1000, msg: String = "Unknown error") =
         """{"code":$code,"msg":"$msg"}"""
+
+    /** Package D — `/fapi/v1/userTrades` fixture. */
+    fun userTrades(vararg fills: Map<String, String>): String {
+        val items = fills.joinToString(",") { f ->
+            """{"orderId":"${f["orderId"] ?: "1"}","side":"${f["side"] ?: "BUY"}","price":"${f["price"] ?: "65000"}","qty":"${f["qty"] ?: "0.01"}","time":${f["time"] ?: "0"},"realizedPnl":"${f["pnl"] ?: "0"}"}"""
+        }
+        return "[$items]"
+    }
 }
 
 object BybitResponses {
@@ -75,6 +83,14 @@ object BybitResponses {
 
     fun apiError(code: Int = 10001, msg: String = "Unknown error") =
         """{"retCode":$code,"retMsg":"$msg"}"""
+
+    /** Package D — `/v5/execution/list` fixture. */
+    fun executionList(vararg fills: Map<String, String>): String {
+        val items = fills.joinToString(",") { f ->
+            """{"orderId":"${f["orderId"] ?: "b1"}","side":"${f["side"] ?: "Buy"}","execPrice":"${f["price"] ?: "65000"}","execQty":"${f["qty"] ?: "0.01"}","execTime":"${f["time"] ?: "0"}","closedSize":"${f["closedSize"] ?: "0"}"}"""
+        }
+        return """{"retCode":0,"retMsg":"OK","result":{"list":[$items]}}"""
+    }
 }
 
 object OkxResponses {
@@ -125,6 +141,14 @@ object OkxResponses {
 
     fun apiError(code: Int = 50000, msg: String = "Unknown error") =
         """{"code":"$code","msg":"$msg","data":[]}"""
+
+    /** Package D — `/api/v5/trade/fills-history` fixture. */
+    fun fillsHistory(vararg fills: Map<String, String>): String {
+        val items = fills.joinToString(",") { f ->
+            """{"ordId":"${f["orderId"] ?: "o1"}","side":"${f["side"] ?: "buy"}","fillPx":"${f["price"] ?: "65000"}","fillSz":"${f["qty"] ?: "1"}","ts":"${f["time"] ?: "0"}","fillPnl":"${f["pnl"] ?: "0"}","execType":"${f["execType"] ?: "T"}"}"""
+        }
+        return """{"code":"0","msg":"","data":[$items]}"""
+    }
 }
 
 object BingXResponses {
@@ -169,4 +193,12 @@ object BingXResponses {
 
     fun apiError(code: Int = -1, msg: String = "Unknown error") =
         """{"code":$code,"msg":"$msg"}"""
+
+    /** Package D — `/openApi/swap/v2/trade/fillHistory` fixture (v2 wrapper). */
+    fun fillHistory(vararg fills: Map<String, String>): String {
+        val items = fills.joinToString(",") { f ->
+            """{"orderId":"${f["orderId"] ?: "bx1"}","side":"${f["side"] ?: "BUY"}","price":"${f["price"] ?: "65000"}","volume":"${f["qty"] ?: "0.01"}","filledTm":"${f["time"] ?: "0"}","realisedPNL":"${f["pnl"] ?: "0"}"}"""
+        }
+        return """{"code":0,"msg":"","data":{"fill_history":[$items]}}"""
+    }
 }

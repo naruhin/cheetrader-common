@@ -1,5 +1,6 @@
 package com.cheetrader.common.exchange.okx
 
+import com.cheetrader.common.exchange.ExchangeFill
 import com.cheetrader.common.exchange.ExchangePosition
 import com.cheetrader.common.exchange.ExchangeService
 import com.cheetrader.common.exchange.extractMultiTpParams
@@ -190,6 +191,12 @@ class OkxExchangeService(
                 val conditionalErrors = mutableListOf<String>()
                 val closeSide = if (isBuy) OkxConstants.SIDE_SELL else OkxConstants.SIDE_BUY
 
+                // Package C.2 — capture algo IDs for TP/trailing so the gateway can
+                // reconcile close events back to this execution. SL is embedded in
+                // the main order on OKX (no separate algo ID).
+                val capturedTpOrderIds = mutableListOf<String>()
+                var capturedTrailingOrderId: String? = null
+
                 // Multi-stage take-profit orders
                 if (multiTp != null) {
                     val precision = quantity.scale()
@@ -202,18 +209,22 @@ class OkxExchangeService(
                     if (tp1Qty > BigDecimal.ZERO && tp2Qty > BigDecimal.ZERO) {
                         val tp1Result = placeTpAlgoOrder(instId, closeSide, posSide, multiTp.tp1, tp1Qty)
                         if (tp1Result.isFailure) conditionalErrors.add("TP1: ${tp1Result.exceptionOrNull()?.message}")
+                        else tp1Result.getOrNull()?.takeIf { it.isNotBlank() }?.let(capturedTpOrderIds::add)
 
                         val tp2Result = placeTpAlgoOrder(instId, closeSide, posSide, multiTp.tp2, tp2Qty)
                         if (tp2Result.isFailure) conditionalErrors.add("TP2: ${tp2Result.exceptionOrNull()?.message}")
+                        else tp2Result.getOrNull()?.takeIf { it.isNotBlank() }?.let(capturedTpOrderIds::add)
 
                         if (multiTp.tp3 != null && tp3Qty > BigDecimal.ZERO) {
                             val tp3Result = placeTpAlgoOrder(instId, closeSide, posSide, multiTp.tp3, tp3Qty)
                             if (tp3Result.isFailure) conditionalErrors.add("TP3: ${tp3Result.exceptionOrNull()?.message}")
+                            else tp3Result.getOrNull()?.takeIf { it.isNotBlank() }?.let(capturedTpOrderIds::add)
                         }
                     } else {
                         // Fallback: quantities too small for splitting, use single TP
                         val tpResult = placeTpAlgoOrder(instId, closeSide, posSide, multiTp.tp1, quantity)
                         if (tpResult.isFailure) conditionalErrors.add("TP: ${tpResult.exceptionOrNull()?.message}")
+                        else tpResult.getOrNull()?.takeIf { it.isNotBlank() }?.let(capturedTpOrderIds::add)
                     }
                 }
 
@@ -231,6 +242,8 @@ class OkxExchangeService(
                     )
                     if (trailingResult.isFailure) {
                         conditionalErrors.add("Trailing: ${trailingResult.exceptionOrNull()?.message}")
+                    } else {
+                        capturedTrailingOrderId = trailingResult.getOrNull()?.takeIf { it.isNotBlank() }
                     }
                 }
 
@@ -246,7 +259,9 @@ class OkxExchangeService(
                         signalId = signal.id,
                         status = status,
                         exchangeOrderId = orderId,
-                        errorMessage = conditionalErrors.takeIf { it.isNotEmpty() }?.joinToString("; ")
+                        errorMessage = conditionalErrors.takeIf { it.isNotEmpty() }?.joinToString("; "),
+                        tpOrderIds = capturedTpOrderIds.toList(),
+                        trailingOrderId = capturedTrailingOrderId
                     )
                 )
             } else {
@@ -373,6 +388,65 @@ class OkxExchangeService(
             Result.success(result)
         } catch (e: Exception) {
             logger.error(e) { "OKX get positions failed" }
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * Package D — `/api/v5/trade/fills-history` returns per-fill records with
+     * `ordId`, side, fillPx, fillSz, ts and `execType`. OKX `execType == "C"`
+     * is a close execution (reduce); we map it to [ExchangeFill.isReduceOnly].
+     * The endpoint caps range at ~3 months; we use `begin` (inclusive) to filter.
+     */
+    override suspend fun getRecentFills(
+        symbol: String,
+        sinceMs: Long,
+        limit: Int
+    ): Result<List<ExchangeFill>> {
+        return try {
+            val instId = convertSymbol(symbol)
+            val params = mutableMapOf(
+                "instType" to "SWAP",
+                "instId" to instId,
+                "begin" to sinceMs.coerceAtLeast(0L).toString(),
+                "limit" to limit.coerceIn(1, 100).toString()
+            )
+            val response = httpClient.executeSignedGet("/api/v5/trade/fills-history", params)
+                ?: return Result.success(emptyList())
+
+            val obj = json.parseToJsonElement(response).jsonObject
+            val code = obj["code"]?.jsonPrimitive?.content
+            if (code != null && code != "0") {
+                val msg = obj["msg"]?.jsonPrimitive?.content ?: "OKX error $code"
+                return Result.failure(Exception("OKX fills-history failed: $msg"))
+            }
+            val data = obj["data"]?.jsonArray ?: JsonArray(emptyList())
+            val fills = data.mapNotNull { item ->
+                val rec = item.jsonObject
+                val ordId = rec["ordId"]?.jsonPrimitive?.content ?: return@mapNotNull null
+                val side = rec["side"]?.jsonPrimitive?.content?.uppercase() ?: return@mapNotNull null
+                val price = rec["fillPx"]?.jsonPrimitive?.content?.toDoubleOrNull() ?: return@mapNotNull null
+                val qty = rec["fillSz"]?.jsonPrimitive?.content?.toDoubleOrNull() ?: return@mapNotNull null
+                val time = rec["ts"]?.jsonPrimitive?.content?.toLongOrNull() ?: 0L
+                val pnl = rec["fillPnl"]?.jsonPrimitive?.content?.toDoubleOrNull()
+                // OKX execType: "T" = taker open, "M" = maker open, "C" = close.
+                // Everything other than explicit "C" is treated as "unknown" rather
+                // than forced-to-false so callers don't over-filter.
+                val execType = rec["execType"]?.jsonPrimitive?.content
+                val reduceOnly: Boolean? = if (execType == "C") true else null
+                ExchangeFill(
+                    orderId = ordId,
+                    side = side,
+                    price = price,
+                    quantity = qty,
+                    time = time,
+                    realizedPnl = pnl,
+                    isReduceOnly = reduceOnly
+                )
+            }
+            Result.success(fills)
+        } catch (e: Exception) {
+            logger.error(e) { "OKX get recent fills failed" }
             Result.failure(e)
         }
     }

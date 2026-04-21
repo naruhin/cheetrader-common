@@ -370,4 +370,42 @@ class BinanceExchangeServiceTest {
     fun `name is Binance`() {
         assertEquals("Binance", service.name)
     }
+
+    // ===== getRecentFills (Package D) =====
+
+    @Test
+    fun `getRecentFills parses orderId side price qty time and pnl`() = runTest {
+        mock.enqueue(BinanceResponses.serverTime())
+        mock.enqueue(
+            BinanceResponses.userTrades(
+                mapOf("orderId" to "entry-1", "side" to "BUY", "price" to "65000", "qty" to "0.01", "time" to "100", "pnl" to "0"),
+                mapOf("orderId" to "tp-1", "side" to "SELL", "price" to "66000", "qty" to "0.01", "time" to "200", "pnl" to "10")
+            )
+        )
+
+        val result = service.getRecentFills("BTCUSDT", sinceMs = 0L, limit = 50)
+        assertTrue(result.isSuccess)
+        val fills = result.getOrThrow()
+        assertEquals(2, fills.size)
+        assertEquals("entry-1", fills[0].orderId)
+        assertEquals("BUY", fills[0].side)
+        assertEquals(65000.0, fills[0].price, 0.001)
+        assertEquals(0.01, fills[0].quantity, 0.0001)
+        assertEquals(100L, fills[0].time)
+        assertEquals(0.0, fills[0].realizedPnl!!, 0.001)
+        // Binance doesn't expose reduceOnly on the trades endpoint — null, not a guess.
+        assertNull(fills[0].isReduceOnly)
+        assertEquals("tp-1", fills[1].orderId)
+        assertEquals(10.0, fills[1].realizedPnl!!, 0.001)
+    }
+
+    @Test
+    fun `getRecentFills empty response is success with empty list`() = runTest {
+        mock.enqueue(BinanceResponses.serverTime())
+        mock.enqueue("[]")
+
+        val result = service.getRecentFills("BTCUSDT", sinceMs = 0L, limit = 50)
+        assertTrue(result.isSuccess)
+        assertTrue(result.getOrThrow().isEmpty())
+    }
 }

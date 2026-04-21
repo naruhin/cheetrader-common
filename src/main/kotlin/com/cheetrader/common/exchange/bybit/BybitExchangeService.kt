@@ -1,6 +1,7 @@
 package com.cheetrader.common.exchange.bybit
 
 import com.cheetrader.common.exchange.ClosedPnlRecord
+import com.cheetrader.common.exchange.ExchangeFill
 import com.cheetrader.common.exchange.ExchangePosition
 import com.cheetrader.common.exchange.ExchangeService
 import com.cheetrader.common.exchange.extractMultiTpParams
@@ -169,6 +170,11 @@ class BybitExchangeService(
                 val orderId = orderResult.getOrThrow()
                 val conditionalErrors = mutableListOf<String>()
 
+                // Package C.2 — capture TP order IDs for close-event reconciliation.
+                // Bybit's SL/single-TP and trailing are positional (no separate order IDs),
+                // so slOrderId and trailingOrderId stay null even on success.
+                val capturedTpOrderIds = mutableListOf<String>()
+
                 // Trailing stop via /v5/position/trading-stop (create order doesn't support it)
                 if (trailingParams != null) {
                     val trailingResult = setTradingStopWithRecalc(
@@ -196,18 +202,22 @@ class BybitExchangeService(
                     if (tp1Qty > BigDecimal.ZERO && tp2Qty > BigDecimal.ZERO) {
                         val tp1Result = placeTpAlgoOrder(symbol, closeSide, usedIdx, isBuy, multiTp.tp1, tp1Qty)
                         if (tp1Result.isFailure) conditionalErrors.add("TP1: ${tp1Result.exceptionOrNull()?.message}")
+                        else tp1Result.getOrNull()?.takeIf { it.isNotBlank() }?.let(capturedTpOrderIds::add)
 
                         val tp2Result = placeTpAlgoOrder(symbol, closeSide, usedIdx, isBuy, multiTp.tp2, tp2Qty)
                         if (tp2Result.isFailure) conditionalErrors.add("TP2: ${tp2Result.exceptionOrNull()?.message}")
+                        else tp2Result.getOrNull()?.takeIf { it.isNotBlank() }?.let(capturedTpOrderIds::add)
 
                         if (multiTp.tp3 != null && tp3Qty > BigDecimal.ZERO) {
                             val tp3Result = placeTpAlgoOrder(symbol, closeSide, usedIdx, isBuy, multiTp.tp3, tp3Qty)
                             if (tp3Result.isFailure) conditionalErrors.add("TP3: ${tp3Result.exceptionOrNull()?.message}")
+                            else tp3Result.getOrNull()?.takeIf { it.isNotBlank() }?.let(capturedTpOrderIds::add)
                         }
                     } else {
                         // Fallback: quantities too small for splitting, use single TP
                         val tpResult = placeTpAlgoOrder(symbol, closeSide, usedIdx, isBuy, multiTp.tp1, quantity)
                         if (tpResult.isFailure) conditionalErrors.add("TP: ${tpResult.exceptionOrNull()?.message}")
+                        else tpResult.getOrNull()?.takeIf { it.isNotBlank() }?.let(capturedTpOrderIds::add)
                     }
                 }
 
@@ -223,7 +233,8 @@ class BybitExchangeService(
                         signalId = signal.id,
                         status = status,
                         exchangeOrderId = orderId,
-                        errorMessage = conditionalErrors.takeIf { it.isNotEmpty() }?.joinToString("; ")
+                        errorMessage = conditionalErrors.takeIf { it.isNotEmpty() }?.joinToString("; "),
+                        tpOrderIds = capturedTpOrderIds.toList()
                     )
                 )
             } else {
@@ -869,6 +880,64 @@ class BybitExchangeService(
             cleaned = cleaned.removeSuffix("-SWAP")
         }
         return cleaned.replace("-", "")
+    }
+
+    /**
+     * Package D — `/v5/execution/list` returns each execution's `orderId`,
+     * side, execPrice, execQty, execTime and `closedSize` (the portion of a
+     * position closed by this fill). We expose `closedSize > 0` as
+     * [ExchangeFill.isReduceOnly] since that's the cleanest semantics Bybit
+     * gives us.
+     */
+    override suspend fun getRecentFills(
+        symbol: String,
+        sinceMs: Long,
+        limit: Int
+    ): Result<List<ExchangeFill>> {
+        return tryWithBaseUrls {
+            try {
+                httpClient.syncTime()
+                val params = mutableMapOf(
+                    "category" to BybitConstants.CATEGORY_LINEAR,
+                    "symbol" to convertSymbol(symbol),
+                    "startTime" to sinceMs.coerceAtLeast(0L).toString(),
+                    "limit" to limit.coerceIn(1, 100).toString()
+                )
+                val response = httpClient.executeSignedGet("/v5/execution/list", params)
+                    ?: return@tryWithBaseUrls Result.success(emptyList())
+
+                val error = parseError(response)
+                if (error != null) return@tryWithBaseUrls Result.failure(error)
+
+                val obj = json.parseToJsonElement(response).jsonObject
+                val list = obj["result"]?.jsonObject?.get("list")?.jsonArray ?: JsonArray(emptyList())
+                val fills = list.mapNotNull { item ->
+                    val rec = item.jsonObject
+                    val orderId = rec["orderId"]?.jsonPrimitive?.content ?: return@mapNotNull null
+                    val side = rec["side"]?.jsonPrimitive?.content?.uppercase() ?: return@mapNotNull null
+                    val price = rec["execPrice"]?.jsonPrimitive?.content?.toDoubleOrNull() ?: return@mapNotNull null
+                    val qty = rec["execQty"]?.jsonPrimitive?.content?.toDoubleOrNull() ?: return@mapNotNull null
+                    val time = rec["execTime"]?.jsonPrimitive?.content?.toLongOrNull() ?: 0L
+                    val closedSize = rec["closedSize"]?.jsonPrimitive?.content?.toDoubleOrNull() ?: 0.0
+                    val reduceOnly = closedSize > 0
+                    // Bybit exposes execFee but not realized PnL on this endpoint;
+                    // keep realizedPnl null rather than faking it.
+                    ExchangeFill(
+                        orderId = orderId,
+                        side = side,
+                        price = price,
+                        quantity = qty,
+                        time = time,
+                        realizedPnl = null,
+                        isReduceOnly = reduceOnly
+                    )
+                }
+                Result.success(fills)
+            } catch (e: Exception) {
+                logger.error(e) { "Bybit get recent fills failed" }
+                Result.failure(e)
+            }
+        }
     }
 
     override suspend fun getClosedPnl(limit: Int): Result<List<ClosedPnlRecord>> {

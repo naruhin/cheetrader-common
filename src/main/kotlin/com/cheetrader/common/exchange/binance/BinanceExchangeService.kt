@@ -1,6 +1,7 @@
 package com.cheetrader.common.exchange.binance
 
 import com.cheetrader.common.exchange.ClosedPnlRecord
+import com.cheetrader.common.exchange.ExchangeFill
 import com.cheetrader.common.exchange.ExchangePosition
 import com.cheetrader.common.exchange.ExchangeService
 import com.cheetrader.common.exchange.extractMultiTpParams
@@ -164,6 +165,13 @@ class BinanceExchangeService(
 
                 val positionQty = orderData.quantity ?: quantity
 
+                // Package C.2 — capture exchange-side order IDs for close-event
+                // reconciliation. Binance is the richest adapter because SL, TPs and
+                // trailing are all separate algo orders, each with its own orderId.
+                val capturedTpOrderIds = mutableListOf<String>()
+                var capturedSlOrderId: String? = null
+                var capturedTrailingOrderId: String? = null
+
                 // Multi-stage or single take-profit
                 val multiTp = extractMultiTpParams(signal.metadata, safeTp)
                 if (multiTp != null) {
@@ -185,6 +193,8 @@ class BinanceExchangeService(
                         val tp1Result = placeAlgoOrder("TP1", tp1Params)
                         if (tp1Result.isFailure) {
                             conditionalErrors.add("TP1: ${tp1Result.exceptionOrNull()?.message}")
+                        } else {
+                            tp1Result.getOrNull()?.takeIf { it.isNotBlank() }?.let(capturedTpOrderIds::add)
                         }
 
                         // TP2
@@ -196,6 +206,8 @@ class BinanceExchangeService(
                         val tp2Result = placeAlgoOrder("TP2", tp2Params)
                         if (tp2Result.isFailure) {
                             conditionalErrors.add("TP2: ${tp2Result.exceptionOrNull()?.message}")
+                        } else {
+                            tp2Result.getOrNull()?.takeIf { it.isNotBlank() }?.let(capturedTpOrderIds::add)
                         }
 
                         // TP3 (if present and quantity > 0)
@@ -208,6 +220,8 @@ class BinanceExchangeService(
                             val tp3Result = placeAlgoOrder("TP3", tp3Params)
                             if (tp3Result.isFailure) {
                                 conditionalErrors.add("TP3: ${tp3Result.exceptionOrNull()?.message}")
+                            } else {
+                                tp3Result.getOrNull()?.takeIf { it.isNotBlank() }?.let(capturedTpOrderIds::add)
                             }
                         }
                     } else {
@@ -220,6 +234,8 @@ class BinanceExchangeService(
                         val result = placeAlgoOrder("TP", params)
                         if (result.isFailure) {
                             conditionalErrors.add("TP: ${result.exceptionOrNull()?.message}")
+                        } else {
+                            result.getOrNull()?.takeIf { it.isNotBlank() }?.let(capturedTpOrderIds::add)
                         }
                     }
 
@@ -242,6 +258,8 @@ class BinanceExchangeService(
                         val result = placeAlgoOrder("TP", params)
                         if (result.isFailure) {
                             conditionalErrors.add("TP: ${result.exceptionOrNull()?.message}")
+                        } else {
+                            result.getOrNull()?.takeIf { it.isNotBlank() }?.let(capturedTpOrderIds::add)
                         }
                     }
                 }
@@ -257,6 +275,8 @@ class BinanceExchangeService(
                     }
                     if (result.isFailure) {
                         conditionalErrors.add("SL: ${result.exceptionOrNull()?.message}")
+                    } else {
+                        capturedSlOrderId = result.getOrNull()?.takeIf { it.isNotBlank() }
                     }
                 }
 
@@ -274,6 +294,8 @@ class BinanceExchangeService(
                     )
                     if (result.isFailure) {
                         conditionalErrors.add("Trailing: ${result.exceptionOrNull()?.message}")
+                    } else {
+                        capturedTrailingOrderId = result.getOrNull()?.takeIf { it.isNotBlank() }
                     }
                 }
 
@@ -294,7 +316,10 @@ class BinanceExchangeService(
                         // Surfacing 0.0 as the executed price breaks PnL math downstream.
                         executedPrice = orderData.averagePrice?.toDouble()?.takeIf { it > 0.0 },
                         executedQuantity = orderData.quantity?.toDouble()?.takeIf { it > 0.0 },
-                        errorMessage = conditionalErrors.takeIf { it.isNotEmpty() }?.joinToString("; ")
+                        errorMessage = conditionalErrors.takeIf { it.isNotEmpty() }?.joinToString("; "),
+                        slOrderId = capturedSlOrderId,
+                        tpOrderIds = capturedTpOrderIds.toList(),
+                        trailingOrderId = capturedTrailingOrderId
                     )
                 )
             } else {
@@ -749,6 +774,60 @@ class BinanceExchangeService(
                 ?: return Result.failure(BinanceException("Cannot parse price"))
             Result.success(price)
         } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * Package D — `/fapi/v1/userTrades` lists each fill with its `orderId`,
+     * side, qty, price, timestamp and realizedPnl. Binance doesn't surface a
+     * dedicated `reduceOnly` flag on the trades endpoint, but realizedPnl!=0
+     * on a fill is a strong signal that it closed/reduced a position — we
+     * pass that through so callers can filter if they need.
+     */
+    override suspend fun getRecentFills(
+        symbol: String,
+        sinceMs: Long,
+        limit: Int
+    ): Result<List<ExchangeFill>> {
+        return try {
+            httpClient.syncTime()
+            val params = mutableMapOf(
+                "symbol" to symbol.uppercase(),
+                "startTime" to sinceMs.coerceAtLeast(0L).toString(),
+                "limit" to limit.coerceIn(1, 1000).toString()
+            )
+            val response = httpClient.executeSignedGet("/fapi/v1/userTrades", params)
+                ?: return Result.success(emptyList())
+
+            val array = json.parseToJsonElement(response) as? JsonArray
+                ?: return Result.success(emptyList())
+
+            val fills = array.mapNotNull { item ->
+                val obj = item.jsonObject
+                val orderId = obj["orderId"]?.jsonPrimitive?.content ?: return@mapNotNull null
+                val side = obj["side"]?.jsonPrimitive?.content?.uppercase() ?: return@mapNotNull null
+                val price = obj["price"]?.jsonPrimitive?.content?.toDoubleOrNull() ?: return@mapNotNull null
+                val qty = obj["qty"]?.jsonPrimitive?.content?.toDoubleOrNull() ?: return@mapNotNull null
+                val time = obj["time"]?.jsonPrimitive?.content?.toLongOrNull() ?: 0L
+                val realizedPnl = obj["realizedPnl"]?.jsonPrimitive?.content?.toDoubleOrNull()
+                // Binance marks reduce-only fills implicitly: realizedPnl is populated
+                // (non-zero or present) when a fill settles against an existing position.
+                // We pass `null` rather than a guess to keep semantics honest — callers
+                // should match on orderId, not on isReduceOnly.
+                ExchangeFill(
+                    orderId = orderId,
+                    side = side,
+                    price = price,
+                    quantity = qty,
+                    time = time,
+                    realizedPnl = realizedPnl,
+                    isReduceOnly = null
+                )
+            }
+            Result.success(fills)
+        } catch (e: Exception) {
+            logger.error(e) { "Binance get recent fills failed" }
             Result.failure(e)
         }
     }

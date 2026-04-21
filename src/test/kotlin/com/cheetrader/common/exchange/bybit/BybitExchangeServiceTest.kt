@@ -337,4 +337,39 @@ class BybitExchangeServiceTest {
     fun `name is Bybit`() {
         assertEquals("Bybit", service.name)
     }
+
+    // ===== getRecentFills (Package D) =====
+
+    @Test
+    fun `getRecentFills maps closedSize to isReduceOnly`() = runTest {
+        mock.enqueue(BybitResponses.serverTime())
+        mock.enqueue(
+            BybitResponses.executionList(
+                mapOf("orderId" to "open-1", "side" to "Buy", "price" to "65000", "qty" to "0.01", "time" to "100", "closedSize" to "0"),
+                mapOf("orderId" to "tp-1", "side" to "Sell", "price" to "66000", "qty" to "0.01", "time" to "200", "closedSize" to "0.01")
+            )
+        )
+
+        val result = service.getRecentFills("BTCUSDT", sinceMs = 0L, limit = 50)
+        assertTrue(result.isSuccess)
+        val fills = result.getOrThrow()
+        assertEquals(2, fills.size)
+        // Open fill: closedSize 0 → isReduceOnly false.
+        assertEquals("open-1", fills[0].orderId)
+        assertEquals("BUY", fills[0].side)       // side uppercased
+        assertEquals(false, fills[0].isReduceOnly)
+        // Close fill: closedSize > 0 → isReduceOnly true.
+        assertEquals("tp-1", fills[1].orderId)
+        assertEquals(true, fills[1].isReduceOnly)
+    }
+
+    @Test
+    fun `getRecentFills empty list is success`() = runTest {
+        mock.enqueue(BybitResponses.serverTime())
+        mock.enqueue(BybitResponses.executionList())
+
+        val result = service.getRecentFills("BTCUSDT", sinceMs = 0L, limit = 50)
+        assertTrue(result.isSuccess)
+        assertTrue(result.getOrThrow().isEmpty())
+    }
 }

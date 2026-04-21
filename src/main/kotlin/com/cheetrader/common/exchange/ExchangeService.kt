@@ -67,7 +67,60 @@ interface ExchangeService {
      */
     suspend fun getClosedPnl(limit: Int = 50): Result<List<ClosedPnlRecord>> =
         Result.success(emptyList())
+
+    /**
+     * Fetch recent fills (executions) for [symbol] since [sinceMs] inclusive.
+     *
+     * Package D — client-authoritative close attribution. After a position
+     * disappears, the client calls this to find which conditional order
+     * (SL / TP / trailing) actually filled; [ExchangeFill.orderId] is compared
+     * against the slOrderId / tpOrderIds / trailingOrderId captured at
+     * placement time. Matching lets the UI label the close with the real
+     * reason instead of blindly trusting the server-sent event (which is
+     * computed against Binance kline close and can be wrong for users on
+     * BingX/Bybit/OKX).
+     *
+     * Default implementation returns an empty list; clients then fall back to
+     * the server-sent hint.
+     *
+     * @param symbol Canonical symbol (adapter normalises per exchange).
+     * @param sinceMs Unix millis lower bound (inclusive). Typically
+     *        `trade.openedAt - 60_000` for safety overlap.
+     * @param limit Max records; each exchange clamps internally.
+     */
+    suspend fun getRecentFills(
+        symbol: String,
+        sinceMs: Long,
+        limit: Int = 50
+    ): Result<List<ExchangeFill>> = Result.success(emptyList())
 }
+
+/**
+ * A single trade execution (fill) as reported by the exchange.
+ *
+ * This is a normalised view across BingX / Bybit / OKX / Binance — each
+ * exchange names and structures its fill records differently. Fields the
+ * client cares about: [orderId] for matching against stored conditional
+ * order IDs, [side] + [quantity] for sanity-checking that this fill
+ * actually reduced the position.
+ *
+ * @property orderId Exchange order id that triggered this fill. **Empty
+ *   string means the exchange didn't surface one** — treat as no-match.
+ * @property side "BUY" or "SELL" (normalised upper-case).
+ * @property isReduceOnly `true` if this fill is known to have reduced a
+ *   position, `false` if it opened/added, `null` if the exchange doesn't
+ *   expose the flag on its fills endpoint (BingX). Clients using the value
+ *   for filtering should treat `null` as "unknown — don't exclude".
+ */
+data class ExchangeFill(
+    val orderId: String,
+    val side: String,
+    val price: Double,
+    val quantity: Double,
+    val time: Long,
+    val realizedPnl: Double? = null,
+    val isReduceOnly: Boolean? = null
+)
 
 /**
  * Exchange position with P&L data as reported by the exchange

@@ -309,4 +309,38 @@ class OkxExchangeServiceTest {
     fun `name is OKX`() {
         assertEquals("OKX", service.name)
     }
+
+    // ===== getRecentFills (Package D) =====
+
+    @Test
+    fun `getRecentFills maps execType C to isReduceOnly true`() = runTest {
+        mock.enqueue(
+            OkxResponses.fillsHistory(
+                mapOf("orderId" to "open-1", "side" to "buy", "price" to "65000", "qty" to "1", "time" to "100", "execType" to "T"),
+                mapOf("orderId" to "tp-1", "side" to "sell", "price" to "66000", "qty" to "1", "time" to "200", "execType" to "C", "pnl" to "10")
+            )
+        )
+
+        val result = service.getRecentFills("BTCUSDT", sinceMs = 0L, limit = 50)
+        assertTrue(result.isSuccess)
+        val fills = result.getOrThrow()
+        assertEquals(2, fills.size)
+        // Open execution (execType=T) → unknown reduceOnly (null, not false — honest).
+        assertEquals("open-1", fills[0].orderId)
+        assertEquals("BUY", fills[0].side)
+        assertNull(fills[0].isReduceOnly)
+        // Close execution (execType=C) → reduceOnly true.
+        assertEquals("tp-1", fills[1].orderId)
+        assertEquals(true, fills[1].isReduceOnly)
+        assertEquals(10.0, fills[1].realizedPnl!!, 0.001)
+    }
+
+    @Test
+    fun `getRecentFills empty data returns empty list`() = runTest {
+        mock.enqueue(OkxResponses.fillsHistory())
+
+        val result = service.getRecentFills("BTCUSDT", sinceMs = 0L, limit = 50)
+        assertTrue(result.isSuccess)
+        assertTrue(result.getOrThrow().isEmpty())
+    }
 }

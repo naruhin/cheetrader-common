@@ -185,7 +185,7 @@ class BingXExchangeServiceTest {
     }
 
     @Test
-    fun `executeSignal with trailing stop`() = runTest {
+    fun `executeSignal with trailing stop captures trailing order id`() = runTest {
         val signal = TestSignals.longBtc(
             tp = 70000.0,
             sl = 60000.0,
@@ -199,13 +199,21 @@ class BingXExchangeServiceTest {
         mock.enqueue(BingXResponses.leverageSuccess())
         mock.enqueue(BingXResponses.marketPrice(65000.0))
         mock.enqueue(BingXResponses.orderSuccess())
-        mock.enqueue(BingXResponses.trailingStopSuccess())
+        mock.enqueue(BingXResponses.trailingStopSuccess("trailing-999"))
         mock.enqueue(BingXResponses.serverTime())
         mock.enqueue(BingXResponses.positions("BTC-USDT", 0.010, "LONG"))
 
         val result = service.executeSignal(signal, 5.0)
         assertTrue(result.isSuccess)
-        assertEquals(ExecutionStatus.SUCCESS, result.getOrThrow().status)
+        val exec = result.getOrThrow()
+        assertEquals(ExecutionStatus.SUCCESS, exec.status)
+        // Package C.2 — trailing order ID must be captured so the gateway can
+        // later map a trailing-triggered close back to this execution.
+        assertEquals("trailing-999", exec.trailingOrderId)
+        // BingX embeds SL in the main order and there's no separate TP here
+        // (single-TP mode — TP is embedded too), so both stay empty.
+        assertNull(exec.slOrderId)
+        assertEquals(emptyList<String>(), exec.tpOrderIds)
     }
 
     @Test
@@ -471,5 +479,37 @@ class BingXExchangeServiceTest {
     @Test
     fun `name is BingX`() {
         assertEquals("BingX", service.name)
+    }
+
+    // ===== getRecentFills (Package D) =====
+
+    @Test
+    fun `getRecentFills parses wrapped v2 fill_history payload`() = runTest {
+        mock.enqueue(
+            BingXResponses.fillHistory(
+                mapOf("orderId" to "entry-1", "side" to "BUY", "price" to "65000", "qty" to "0.01", "time" to "100", "pnl" to "0"),
+                mapOf("orderId" to "tp-1", "side" to "SELL", "price" to "66000", "qty" to "0.01", "time" to "200", "pnl" to "10")
+            )
+        )
+
+        val result = service.getRecentFills("BTCUSDT", sinceMs = 0L, limit = 50)
+        assertTrue(result.isSuccess)
+        val fills = result.getOrThrow()
+        assertEquals(2, fills.size)
+        assertEquals("entry-1", fills[0].orderId)
+        assertEquals("BUY", fills[0].side)
+        assertEquals(65000.0, fills[0].price, 0.001)
+        // BingX doesn't expose reduceOnly — null for safety.
+        assertNull(fills[0].isReduceOnly)
+        assertEquals("tp-1", fills[1].orderId)
+        assertEquals(10.0, fills[1].realizedPnl!!, 0.001)
+    }
+
+    @Test
+    fun `getRecentFills propagates API error as failure`() = runTest {
+        mock.enqueue(BingXResponses.apiError(-1, "Invalid symbol"))
+
+        val result = service.getRecentFills("INVALID", sinceMs = 0L, limit = 50)
+        assertTrue(result.isFailure)
     }
 }

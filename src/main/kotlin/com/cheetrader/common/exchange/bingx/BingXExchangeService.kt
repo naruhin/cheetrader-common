@@ -1,5 +1,6 @@
 package com.cheetrader.common.exchange.bingx
 
+import com.cheetrader.common.exchange.ExchangeFill
 import com.cheetrader.common.exchange.ExchangePosition
 import com.cheetrader.common.exchange.ExchangeService
 import com.cheetrader.common.exchange.extractMultiTpParams
@@ -178,6 +179,12 @@ class BingXExchangeService(
                 val trailingParams = extractTrailingParams(signal.metadata)
                 var hasTakeProfit = true
 
+                // Package C.2 — capture exchange-side order IDs so the gateway can
+                // reconcile close events back to this execution. SL is always embedded
+                // in the main entry on BingX (no separate ID).
+                val capturedTpOrderIds = mutableListOf<String>()
+                var capturedTrailingOrderId: String? = null
+
                 // Multi-stage take-profit orders
                 if (multiTp != null) {
                     val precision = quantity.scale()
@@ -192,12 +199,16 @@ class BingXExchangeService(
                         if (tp1Result.isFailure) {
                             conditionalErrors.add("TP1: ${tp1Result.exceptionOrNull()?.message}")
                             hasTakeProfit = false
+                        } else {
+                            tp1Result.getOrNull()?.takeIf { it.isNotBlank() }?.let(capturedTpOrderIds::add)
                         }
 
                         val tp2Result = placeTpAlgoOrder(symbol, closeSide, positionSide, multiTp.tp2, tp2Qty)
                         if (tp2Result.isFailure) {
                             conditionalErrors.add("TP2: ${tp2Result.exceptionOrNull()?.message}")
                             hasTakeProfit = false
+                        } else {
+                            tp2Result.getOrNull()?.takeIf { it.isNotBlank() }?.let(capturedTpOrderIds::add)
                         }
 
                         if (multiTp.tp3 != null && tp3Qty > BigDecimal.ZERO) {
@@ -205,6 +216,8 @@ class BingXExchangeService(
                             if (tp3Result.isFailure) {
                                 conditionalErrors.add("TP3: ${tp3Result.exceptionOrNull()?.message}")
                                 hasTakeProfit = false
+                            } else {
+                                tp3Result.getOrNull()?.takeIf { it.isNotBlank() }?.let(capturedTpOrderIds::add)
                             }
                         }
                     } else {
@@ -213,6 +226,8 @@ class BingXExchangeService(
                         if (tpResult.isFailure) {
                             conditionalErrors.add("TP: ${tpResult.exceptionOrNull()?.message}")
                             hasTakeProfit = false
+                        } else {
+                            tpResult.getOrNull()?.takeIf { it.isNotBlank() }?.let(capturedTpOrderIds::add)
                         }
                     }
 
@@ -242,6 +257,8 @@ class BingXExchangeService(
                         // Trailing replaces TP as the profit-exit — if it failed and
                         // no TP was placed, the position has no profit-exit.
                         if (!requestedSingleTp && !hasMultiTp) hasTakeProfit = false
+                    } else {
+                        capturedTrailingOrderId = trailingResult.getOrNull()?.takeIf { it.isNotBlank() }
                     }
                 }
 
@@ -278,7 +295,11 @@ class BingXExchangeService(
                     executedQuantity = orderData.quantity?.toDoubleOrNull()?.takeIf { it > 0.0 },
                     errorMessage = conditionalErrors.takeIf { it.isNotEmpty() }?.joinToString("; "),
                     hasExchangeStopLoss = hasStopLoss,
-                    hasExchangeTakeProfit = hasTakeProfit
+                    hasExchangeTakeProfit = hasTakeProfit,
+                    // slOrderId stays null: BingX embeds SL in the main entry order.
+                    slOrderId = null,
+                    tpOrderIds = capturedTpOrderIds.toList(),
+                    trailingOrderId = capturedTrailingOrderId
                 ))
             } else {
                 // Propagate the real exception so the caller's Result.onFailure /
@@ -428,6 +449,72 @@ class BingXExchangeService(
             }
         } catch (e: Exception) {
             logger.error(e) { "Failed to get positions" }
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * Package D — `/openApi/swap/v2/trade/fillHistory` returns the user's
+     * recent fills with `orderId`, side, price, volume and `tradingTime`.
+     * BingX doesn't expose a `reduceOnly` flag on fills; we pass `null` and
+     * let the caller match by orderId alone. `realisedPNL` is present per
+     * fill when it closed a position.
+     */
+    override suspend fun getRecentFills(
+        symbol: String,
+        sinceMs: Long,
+        limit: Int
+    ): Result<List<ExchangeFill>> {
+        return try {
+            val bingxSymbol = convertSymbol(symbol)
+            val params = mutableMapOf(
+                "symbol" to bingxSymbol,
+                "startTs" to sinceMs.coerceAtLeast(0L).toString(),
+                "endTs" to System.currentTimeMillis().toString(),
+                "limit" to limit.coerceIn(1, 1000).toString()
+            )
+            val response = httpClient.executeSignedGet("/openApi/swap/v2/trade/fillHistory", params)
+                ?: return Result.success(emptyList())
+
+            val root = json.parseToJsonElement(response).jsonObject
+            val code = root["code"]?.jsonPrimitive?.intOrNull
+            if (code != null && code != 0) {
+                val msg = root["msg"]?.jsonPrimitive?.content ?: "BingX error $code"
+                return Result.failure(Exception("BingX fillHistory failed: $msg"))
+            }
+            // BingX wraps results under data.fill_history (v2).
+            val data = root["data"]?.jsonObject
+            val array = data?.get("fill_history")?.jsonArray
+                ?: data?.get("fillHistoryOrders")?.jsonArray
+                ?: root["data"] as? JsonArray
+                ?: return Result.success(emptyList())
+
+            val fills = array.mapNotNull { item ->
+                val rec = item.jsonObject
+                val orderId = rec["orderId"]?.jsonPrimitive?.content ?: return@mapNotNull null
+                val side = rec["side"]?.jsonPrimitive?.content?.uppercase() ?: return@mapNotNull null
+                val price = rec["price"]?.jsonPrimitive?.content?.toDoubleOrNull() ?: return@mapNotNull null
+                val qty = rec["volume"]?.jsonPrimitive?.content?.toDoubleOrNull()
+                    ?: rec["qty"]?.jsonPrimitive?.content?.toDoubleOrNull()
+                    ?: return@mapNotNull null
+                val time = rec["filledTm"]?.jsonPrimitive?.content?.toLongOrNull()
+                    ?: rec["tradingTime"]?.jsonPrimitive?.content?.toLongOrNull()
+                    ?: 0L
+                val pnl = rec["realisedPNL"]?.jsonPrimitive?.content?.toDoubleOrNull()
+                    ?: rec["profit"]?.jsonPrimitive?.content?.toDoubleOrNull()
+                ExchangeFill(
+                    orderId = orderId,
+                    side = side,
+                    price = price,
+                    quantity = qty,
+                    time = time,
+                    realizedPnl = pnl,
+                    isReduceOnly = null
+                )
+            }
+            Result.success(fills)
+        } catch (e: Exception) {
+            logger.error(e) { "BingX get recent fills failed" }
             Result.failure(e)
         }
     }
