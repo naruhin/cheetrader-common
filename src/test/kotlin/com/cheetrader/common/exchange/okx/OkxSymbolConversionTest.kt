@@ -26,6 +26,14 @@ class OkxSymbolConversionTest {
     @Test fun `convertSymbol strips 1000 prefix SHIB`() = assertEquals("SHIB-USDT-SWAP", service.convertSymbol("1000SHIBUSDT"))
     @Test fun `convertSymbol strips 1000 prefix PEPE`() = assertEquals("PEPE-USDT-SWAP", service.convertSymbol("1000PEPEUSDT"))
 
+    // denormalizeSymbol round-trip — reverse of convertSymbol for position / fill payloads
+    @Test fun `denormalize BTC-USDT-SWAP`() = assertEquals("BTCUSDT", service.denormalizeSymbol("BTC-USDT-SWAP"))
+    @Test fun `denormalize already flat`() = assertEquals("BTCUSDT", service.denormalizeSymbol("BTCUSDT"))
+    @Test fun `denormalize without SWAP suffix`() = assertEquals("BTCUSDT", service.denormalizeSymbol("BTC-USDT"))
+    @Test fun `denormalize USDC quote`() = assertEquals("ETHUSDC", service.denormalizeSymbol("ETH-USDC-SWAP"))
+    // Lossy edge: OKX doesn't carry the 1000-prefix convention, so this is expected.
+    @Test fun `denormalize memecoin returns base without 1000 prefix`() = assertEquals("PEPEUSDT", service.denormalizeSymbol("PEPE-USDT-SWAP"))
+
     @Test fun `sanitizeTpSl valid long`() {
         val (tp, sl) = service.sanitizeTpSl(true, 65000.0, 70000.0, 60000.0)
         assertEquals(70000.0, tp)

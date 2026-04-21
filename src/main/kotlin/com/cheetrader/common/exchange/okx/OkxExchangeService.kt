@@ -254,11 +254,22 @@ class OkxExchangeService(
                     ExecutionStatus.SUCCESS
                 }
 
+                // Post-placement hotfix 2026-04-21: OKX POST /api/v5/trade/order
+                // returns only the ordId — no avgPx / accFillSz. Without a
+                // follow-up GET, OrderExecution.executedPrice stays null and
+                // downstream clients report `price=0.0` to the gateway (live
+                // log confirmed this on 2026-04-21). Fetch the fill details
+                // now (best-effort; don't fail the whole execution if this
+                // extra call errors).
+                val fill = fetchOrderFill(instId, orderId)
+
                 Result.success(
                     OrderExecution(
                         signalId = signal.id,
                         status = status,
                         exchangeOrderId = orderId,
+                        executedPrice = fill?.avgPx,
+                        executedQuantity = fill?.accFillSz,
                         errorMessage = conditionalErrors.takeIf { it.isNotEmpty() }?.joinToString("; "),
                         tpOrderIds = capturedTpOrderIds.toList(),
                         trailingOrderId = capturedTrailingOrderId
@@ -275,6 +286,60 @@ class OkxExchangeService(
             logger.error(e) { "OKX execute signal failed: ${signal.id}" }
             Result.failure(e)
         }
+    }
+
+    /**
+     * Post-placement fill snapshot. OKX's `POST /api/v5/trade/order` only
+     * returns `ordId`; avg fill price requires a follow-up `GET
+     * /api/v5/trade/order?ordId=X&instId=Y`. Market orders usually have
+     * `avgPx` populated within a few hundred ms; we do 3 retries × 200 ms
+     * with exponential backoff, parsing the sentinel empty-strings OKX
+     * uses for un-filled orders as null so the caller can distinguish
+     * "fetch failed" from "no fills yet".
+     *
+     * All errors are swallowed — the fill data is best-effort UX info,
+     * not a source of truth. If the call fails entirely, executedPrice
+     * stays null and clients fall back to signal entry price.
+     */
+    private data class OrderFillInfo(val avgPx: Double?, val accFillSz: Double?)
+
+    private suspend fun fetchOrderFill(instId: String, orderId: String): OrderFillInfo? {
+        val delays = longArrayOf(150L, 300L, 600L)
+        for ((attempt, d) in delays.withIndex()) {
+            try {
+                kotlinx.coroutines.delay(d)
+                val response = httpClient.executeSignedGet(
+                    "/api/v5/trade/order",
+                    mapOf("ordId" to orderId, "instId" to instId)
+                ) ?: continue
+
+                val obj = json.parseToJsonElement(response).jsonObject
+                if (obj["code"]?.jsonPrimitive?.content != "0") continue
+                val data = obj["data"]?.jsonArray?.firstOrNull()?.jsonObject ?: continue
+
+                // OKX uses "" as the sentinel for "not yet filled" — blank out
+                // to null so downstream doesn't parse 0.0 and mis-report a
+                // phantom $0 fill (same class of bug as BingX avgPrice="0"
+                // fixed in Package A).
+                val avgPx = data["avgPx"]?.jsonPrimitive?.content
+                    ?.takeIf { it.isNotBlank() }
+                    ?.toDoubleOrNull()
+                    ?.takeIf { it > 0.0 }
+                val accSz = data["accFillSz"]?.jsonPrimitive?.content
+                    ?.takeIf { it.isNotBlank() }
+                    ?.toDoubleOrNull()
+                    ?.takeIf { it > 0.0 }
+
+                if (avgPx != null && accSz != null) {
+                    return OrderFillInfo(avgPx, accSz)
+                }
+                logger.debug { "OKX order $orderId not yet filled (attempt ${attempt + 1}/${delays.size})" }
+            } catch (e: Exception) {
+                logger.warn { "OKX fetch-order-fill attempt ${attempt + 1} failed for $orderId: ${e.message}" }
+            }
+        }
+        logger.warn { "OKX order $orderId has no avgPx after ${delays.size} retries — executedPrice left null" }
+        return null
     }
 
     override suspend fun closePosition(symbol: String): Result<OrderExecution> {
@@ -374,7 +439,12 @@ class OkxExchangeService(
                 }
 
                 ExchangePosition(
-                    symbol = pos["instId"]?.jsonPrimitive?.content ?: return@mapNotNull null,
+                    // Denormalize OKX-native instId → universal symbol. Without
+                    // this, ActiveTrade.symbol gets overwritten by the polling
+                    // path with "BTC-USDT-SWAP" which the dashboard truncates
+                    // to "BTC-" (live regression 2026-04-21).
+                    symbol = pos["instId"]?.jsonPrimitive?.content
+                        ?.let(::denormalizeSymbol) ?: return@mapNotNull null,
                     side = side,
                     size = kotlin.math.abs(posSize),
                     entryPrice = pos["avgPx"]?.jsonPrimitive?.content?.toDoubleOrNull() ?: 0.0,
@@ -983,6 +1053,23 @@ class OkxExchangeService(
 
         // Enforce minimum
         return if (contracts < info.minSz) BigDecimal.ZERO else contracts
+    }
+
+    /**
+     * Denormalizes OKX instId (`BTC-USDT-SWAP`) back into the universal symbol
+     * format (`BTCUSDT`) used in signals + ActiveTrade + UI. Fixes the
+     * 2026-04-21 live regression where OKX positions displayed as "BTC-"
+     * (truncated OKX-native format) instead of "BTCUSDT" on the dashboard.
+     *
+     * Lossy edge: OKX doesn't use the "1000" multiplier prefix, so
+     * `PEPE-USDT-SWAP` maps to `PEPEUSDT` even when the signal was
+     * `1000PEPEUSDT`. Callers that need exact round-trip should preserve
+     * the original signal symbol rather than relying on this method.
+     */
+    internal fun denormalizeSymbol(instId: String): String {
+        if (!instId.contains("-")) return instId
+        val parts = instId.removeSuffix("-SWAP").split("-")
+        return if (parts.size >= 2) parts.joinToString("") else instId
     }
 
     internal fun convertSymbol(symbol: String): String {
