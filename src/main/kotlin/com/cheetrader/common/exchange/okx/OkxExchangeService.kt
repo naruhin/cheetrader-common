@@ -250,23 +250,15 @@ class OkxExchangeService(
                     )
                 )
             } else {
-                Result.success(
-                    OrderExecution(
-                        signalId = signal.id,
-                        status = ExecutionStatus.FAILED,
-                        errorMessage = orderResult.exceptionOrNull()?.message
-                    )
-                )
+                // Propagate the real exception instead of hiding it inside a
+                // Result.success(FAILED) wrapper (the "silent success" anti-pattern
+                // fixed in Package A for all exchange adapters).
+                Result.failure(orderResult.exceptionOrNull()
+                    ?: OkxException("Order placement failed (no error detail)"))
             }
         } catch (e: Exception) {
             logger.error(e) { "OKX execute signal failed: ${signal.id}" }
-            Result.success(
-                OrderExecution(
-                    signalId = signal.id,
-                    status = ExecutionStatus.FAILED,
-                    errorMessage = e.message
-                )
-            )
+            Result.failure(e)
         }
     }
 

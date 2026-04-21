@@ -289,29 +289,24 @@ class BinanceExchangeService(
                         signalId = signal.id,
                         status = status,
                         exchangeOrderId = orderData.orderId,
-                        executedPrice = orderData.averagePrice?.toDouble(),
-                        executedQuantity = orderData.quantity?.toDouble(),
+                        // Filter out placeholder "0" values — some Binance responses
+                        // return avgPrice=0 for market orders before the fill settles.
+                        // Surfacing 0.0 as the executed price breaks PnL math downstream.
+                        executedPrice = orderData.averagePrice?.toDouble()?.takeIf { it > 0.0 },
+                        executedQuantity = orderData.quantity?.toDouble()?.takeIf { it > 0.0 },
                         errorMessage = conditionalErrors.takeIf { it.isNotEmpty() }?.joinToString("; ")
                     )
                 )
             } else {
-                Result.success(
-                    OrderExecution(
-                        signalId = signal.id,
-                        status = ExecutionStatus.FAILED,
-                        errorMessage = orderResult.exceptionOrNull()?.message
-                    )
-                )
+                // Propagate the real exception instead of hiding it inside a
+                // Result.success(FAILED) wrapper (the "silent success" anti-pattern
+                // fixed in Package A for all exchange adapters).
+                Result.failure(orderResult.exceptionOrNull()
+                    ?: BinanceException("Order placement failed (no error detail)"))
             }
         } catch (e: Exception) {
             logger.error(e) { "Binance execute signal failed: ${signal.id}" }
-            Result.success(
-                OrderExecution(
-                    signalId = signal.id,
-                    status = ExecutionStatus.FAILED,
-                    errorMessage = e.message
-                )
-            )
+            Result.failure(e)
         }
     }
 

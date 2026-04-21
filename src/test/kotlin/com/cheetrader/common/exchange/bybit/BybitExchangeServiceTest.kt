@@ -1,6 +1,7 @@
 package com.cheetrader.common.exchange.bybit
 
 import com.cheetrader.common.model.ExecutionStatus
+import com.cheetrader.common.exchange.bybit.BybitException
 import com.cheetrader.common.testutil.BybitResponses
 import com.cheetrader.common.testutil.MockExchangeServer
 import com.cheetrader.common.testutil.RecordingLogger
@@ -136,7 +137,10 @@ class BybitExchangeServiceTest {
     }
 
     @Test
-    fun `executeSignal order fails returns FAILED`() = runTest {
+    fun `executeSignal order rejected propagates Result failure`() = runTest {
+        // Previously this returned Result.success(OrderExecution(FAILED, ...)) which
+        // caused silent-success bugs in callers using .getOrElse{}. Now Bybit
+        // propagates the exception so callers can handle failure idiomatically.
         val signal = TestSignals.longBtc()
 
         mock.enqueue(BybitResponses.serverTime())
@@ -148,8 +152,10 @@ class BybitExchangeServiceTest {
         mock.enqueue(BybitResponses.apiError(170000, "Order error"))
 
         val result = service.executeSignal(signal, 5.0)
-        assertTrue(result.isSuccess)
-        assertEquals(ExecutionStatus.FAILED, result.getOrThrow().status)
+        assertTrue(result.isFailure, "order rejection must surface as Result.failure")
+        val ex = result.exceptionOrNull()
+        assertNotNull(ex)
+        assertTrue(ex is BybitException, "exception must carry Bybit error detail")
     }
 
     @Test

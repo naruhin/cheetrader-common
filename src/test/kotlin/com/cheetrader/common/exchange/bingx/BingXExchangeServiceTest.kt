@@ -92,7 +92,8 @@ class BingXExchangeServiceTest {
         val signal = TestSignals.longBtc(tp = 70000.0, sl = 60000.0)
 
         // Flow: syncTime, getBalance(syncTime + balance), setupPosition(margin + leverage),
-        //       getMarketPrice(signed GET, no syncTime), placeOrder(signed POST, no syncTime)
+        //       getMarketPrice(signed GET, no syncTime), placeOrder(signed POST, no syncTime),
+        //       verifyPositionOpened(syncTime + positions)
         mock.enqueue(BingXResponses.serverTime())     // syncTime in executeSignal
         mock.enqueue(BingXResponses.serverTime())     // syncTime in getBalance
         mock.enqueue(BingXResponses.balance(1000.0))  // balance
@@ -100,12 +101,16 @@ class BingXExchangeServiceTest {
         mock.enqueue(BingXResponses.leverageSuccess())   // setupPosition leverage
         mock.enqueue(BingXResponses.marketPrice(65000.0)) // getMarketPrice (no syncTime)
         mock.enqueue(BingXResponses.orderSuccess("bingx-order-1")) // placeOrder
+        mock.enqueue(BingXResponses.serverTime())     // verify: syncTime
+        mock.enqueue(BingXResponses.positions("BTC-USDT", 0.010, "LONG")) // verify: positions
 
         val result = service.executeSignal(signal, 5.0)
         assertTrue(result.isSuccess)
         val exec = result.getOrThrow()
         assertEquals(ExecutionStatus.SUCCESS, exec.status)
         assertEquals("bingx-order-1", exec.exchangeOrderId)
+        assertTrue(exec.hasExchangeStopLoss)
+        assertTrue(exec.hasExchangeTakeProfit)
     }
 
     @Test
@@ -119,6 +124,8 @@ class BingXExchangeServiceTest {
         mock.enqueue(BingXResponses.leverageSuccess())
         mock.enqueue(BingXResponses.marketPrice(3500.0))
         mock.enqueue(BingXResponses.orderSuccess())
+        mock.enqueue(BingXResponses.serverTime())
+        mock.enqueue(BingXResponses.positions("ETH-USDT", 0.100, "SHORT"))
 
         val result = service.executeSignal(signal, 5.0)
         assertTrue(result.isSuccess)
@@ -138,7 +145,7 @@ class BingXExchangeServiceTest {
     }
 
     @Test
-    fun `executeSignal order fails returns FAILED`() = runTest {
+    fun `executeSignal order rejected propagates Result failure`() = runTest {
         val signal = TestSignals.longBtc()
 
         mock.enqueue(BingXResponses.serverTime())
@@ -150,8 +157,12 @@ class BingXExchangeServiceTest {
         mock.enqueue(BingXResponses.apiError(100001, "Order rejected"))
 
         val result = service.executeSignal(signal, 5.0)
-        assertTrue(result.isSuccess)
-        assertEquals(ExecutionStatus.FAILED, result.getOrThrow().status)
+        // Previously this returned Result.success(OrderExecution(FAILED, ...)) which
+        // caused silent-success bugs in callers using .getOrElse{}. Now propagate failure.
+        assertTrue(result.isFailure, "order rejection must surface as Result.failure")
+        val ex = result.exceptionOrNull()
+        assertNotNull(ex)
+        assertTrue(ex is BingXApiException, "exception must carry BingX error code")
     }
 
     @Test
@@ -165,6 +176,8 @@ class BingXExchangeServiceTest {
         mock.enqueue(BingXResponses.leverageSuccess())
         mock.enqueue(BingXResponses.marketPrice(65000.0))
         mock.enqueue(BingXResponses.orderSuccess())
+        mock.enqueue(BingXResponses.serverTime())
+        mock.enqueue(BingXResponses.positions("BTC-USDT", 0.010, "LONG"))
 
         val result = service.executeSignal(signal, 5.0)
         assertTrue(result.isSuccess)
@@ -187,6 +200,8 @@ class BingXExchangeServiceTest {
         mock.enqueue(BingXResponses.marketPrice(65000.0))
         mock.enqueue(BingXResponses.orderSuccess())
         mock.enqueue(BingXResponses.trailingStopSuccess())
+        mock.enqueue(BingXResponses.serverTime())
+        mock.enqueue(BingXResponses.positions("BTC-USDT", 0.010, "LONG"))
 
         val result = service.executeSignal(signal, 5.0)
         assertTrue(result.isSuccess)
@@ -194,7 +209,10 @@ class BingXExchangeServiceTest {
     }
 
     @Test
-    fun `executeSignal trailing stop fails returns PARTIAL`() = runTest {
+    fun `executeSignal trailing stop fails returns PARTIAL with hasExchangeTakeProfit false`() = runTest {
+        // No embedded TP and no multi-TP — trailing is the only profit-exit.
+        // When trailing fails, the position has NO profit-exit on the exchange,
+        // so hasExchangeTakeProfit must be false and status must be PARTIAL.
         val signal = TestSignals.longBtc(
             tp = null,
             sl = null,
@@ -208,11 +226,140 @@ class BingXExchangeServiceTest {
         mock.enqueue(BingXResponses.leverageSuccess())
         mock.enqueue(BingXResponses.marketPrice(65000.0))
         mock.enqueue(BingXResponses.orderSuccess())
+        // Trailing recalc path makes 3 attempts on 110416 errors; here we return a
+        // non-activation-price error so it fails fast after the first attempt.
         mock.enqueue(BingXResponses.apiError(-1, "Trailing failed"))
+        mock.enqueue(BingXResponses.serverTime())
+        mock.enqueue(BingXResponses.positions("BTC-USDT", 0.010, "LONG"))
 
         val result = service.executeSignal(signal, 5.0)
         assertTrue(result.isSuccess)
-        assertEquals(ExecutionStatus.PARTIAL, result.getOrThrow().status)
+        val exec = result.getOrThrow()
+        assertEquals(ExecutionStatus.PARTIAL, exec.status)
+        assertFalse(exec.hasExchangeTakeProfit)
+        assertTrue(exec.hasExchangeStopLoss)
+    }
+
+    @Test
+    fun `executeSignal trailing fails but embedded TP exists keeps hasExchangeTakeProfit true`() = runTest {
+        // Embedded TP is placed with the main order. Trailing failure does NOT
+        // leave the position without a profit-exit in this case.
+        val signal = TestSignals.longBtc(
+            tp = 70000.0,
+            sl = 60000.0,
+            metadata = TestSignals.withTrailingStop(deviation = 0.01, triggerPrice = 66000.0)
+        )
+
+        mock.enqueue(BingXResponses.serverTime())
+        mock.enqueue(BingXResponses.serverTime())
+        mock.enqueue(BingXResponses.balance(1000.0))
+        mock.enqueue(BingXResponses.marginTypeSuccess())
+        mock.enqueue(BingXResponses.leverageSuccess())
+        mock.enqueue(BingXResponses.marketPrice(65000.0))
+        mock.enqueue(BingXResponses.orderSuccess())
+        mock.enqueue(BingXResponses.apiError(-1, "Trailing failed"))
+        mock.enqueue(BingXResponses.serverTime())
+        mock.enqueue(BingXResponses.positions("BTC-USDT", 0.010, "LONG"))
+
+        val result = service.executeSignal(signal, 5.0)
+        assertTrue(result.isSuccess)
+        val exec = result.getOrThrow()
+        assertEquals(ExecutionStatus.PARTIAL, exec.status)
+        assertTrue(exec.hasExchangeTakeProfit, "embedded TP keeps profit-exit intact when trailing fails")
+    }
+
+    @Test
+    fun `executeSignal filters avgPrice zero to null`() = runTest {
+        // BingX market orders sometimes return avgPrice="0" when the fill price
+        // hasn't settled yet. We must NOT surface 0.0 downstream — it breaks PnL
+        // calculations and was the root cause of knowledge/2026-04-03 PnL bug.
+        val signal = TestSignals.longBtc(tp = 70000.0, sl = 60000.0)
+
+        mock.enqueue(BingXResponses.serverTime())
+        mock.enqueue(BingXResponses.serverTime())
+        mock.enqueue(BingXResponses.balance(1000.0))
+        mock.enqueue(BingXResponses.marginTypeSuccess())
+        mock.enqueue(BingXResponses.leverageSuccess())
+        mock.enqueue(BingXResponses.marketPrice(65000.0))
+        mock.enqueue(BingXResponses.orderSuccess(avgPrice = "0"))  // <-- the bug trigger
+        mock.enqueue(BingXResponses.serverTime())
+        mock.enqueue(BingXResponses.positions("BTC-USDT", 0.010, "LONG"))
+
+        val result = service.executeSignal(signal, 5.0)
+        assertTrue(result.isSuccess)
+        val exec = result.getOrThrow()
+        assertNull(exec.executedPrice, "avgPrice=0 must become null, not 0.0")
+    }
+
+    @Test
+    fun `executeSignal position never appears returns Result failure`() = runTest {
+        // Main order accepted, but positions endpoint shows nothing across both
+        // verify attempts. We must treat this as FAILED (no ghost ActiveTrade).
+        val signal = TestSignals.longBtc(tp = 70000.0, sl = 60000.0)
+
+        mock.enqueue(BingXResponses.serverTime())
+        mock.enqueue(BingXResponses.serverTime())
+        mock.enqueue(BingXResponses.balance(1000.0))
+        mock.enqueue(BingXResponses.marginTypeSuccess())
+        mock.enqueue(BingXResponses.leverageSuccess())
+        mock.enqueue(BingXResponses.marketPrice(65000.0))
+        mock.enqueue(BingXResponses.orderSuccess("ghost-order"))
+        // verify attempt 1
+        mock.enqueue(BingXResponses.serverTime())
+        mock.enqueue(BingXResponses.positionsEmpty())
+        // verify attempt 2
+        mock.enqueue(BingXResponses.serverTime())
+        mock.enqueue(BingXResponses.positionsEmpty())
+
+        val result = service.executeSignal(signal, 5.0)
+        assertTrue(result.isFailure, "ghost order (accepted but no position) must surface as failure")
+        val ex = result.exceptionOrNull()
+        assertNotNull(ex)
+        assertTrue(ex!!.message!!.contains("did not appear", ignoreCase = true))
+    }
+
+    @Test
+    fun `executeSignal position appears on second verify attempt`() = runTest {
+        // First attempt: empty (settlement delay). Second attempt: position shows up.
+        val signal = TestSignals.longBtc(tp = 70000.0, sl = 60000.0)
+
+        mock.enqueue(BingXResponses.serverTime())
+        mock.enqueue(BingXResponses.serverTime())
+        mock.enqueue(BingXResponses.balance(1000.0))
+        mock.enqueue(BingXResponses.marginTypeSuccess())
+        mock.enqueue(BingXResponses.leverageSuccess())
+        mock.enqueue(BingXResponses.marketPrice(65000.0))
+        mock.enqueue(BingXResponses.orderSuccess())
+        // verify attempt 1: empty
+        mock.enqueue(BingXResponses.serverTime())
+        mock.enqueue(BingXResponses.positionsEmpty())
+        // verify attempt 2: position present
+        mock.enqueue(BingXResponses.serverTime())
+        mock.enqueue(BingXResponses.positions("BTC-USDT", 0.010, "LONG"))
+
+        val result = service.executeSignal(signal, 5.0)
+        assertTrue(result.isSuccess, "retry must succeed when position shows on attempt 2")
+        assertEquals(ExecutionStatus.SUCCESS, result.getOrThrow().status)
+    }
+
+    @Test
+    fun `executeSignal SL already breached is rejected with FAILED`() = runTest {
+        // Pre-flight rejection: signal.stopLoss is 66000 for LONG, but market is 65000.
+        // safeSl becomes null (sanitizeTpSl guard) → we reject without placing an order.
+        val signal = TestSignals.longBtc(tp = 70000.0, sl = 66000.0)
+
+        mock.enqueue(BingXResponses.serverTime())
+        mock.enqueue(BingXResponses.serverTime())
+        mock.enqueue(BingXResponses.balance(1000.0))
+        mock.enqueue(BingXResponses.marginTypeSuccess())
+        mock.enqueue(BingXResponses.leverageSuccess())
+        mock.enqueue(BingXResponses.marketPrice(65000.0)) // market < SL for LONG → breach
+
+        val result = service.executeSignal(signal, 5.0)
+        assertTrue(result.isSuccess)
+        val exec = result.getOrThrow()
+        assertEquals(ExecutionStatus.FAILED, exec.status)
+        assertTrue(exec.errorMessage!!.contains("already breached", ignoreCase = true))
     }
 
     // ===== getOpenPositionsCount =====

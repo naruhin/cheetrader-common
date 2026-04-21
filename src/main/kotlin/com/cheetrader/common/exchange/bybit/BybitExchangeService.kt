@@ -227,23 +227,16 @@ class BybitExchangeService(
                     )
                 )
             } else {
-                Result.success(
-                    OrderExecution(
-                        signalId = signal.id,
-                        status = ExecutionStatus.FAILED,
-                        errorMessage = orderResult.exceptionOrNull()?.message
-                    )
-                )
+                // Propagate the real exception so the caller's Result.onFailure /
+                // getOrElse branch actually fires. Wrapping failure inside
+                // Result.success(FAILED) silently swallowed every Bybit error and
+                // matched the "silent success" class of bugs that Package A fixes.
+                Result.failure(orderResult.exceptionOrNull()
+                    ?: BybitException("Order placement failed (no error detail)"))
             }
         } catch (e: Exception) {
             logger.error(e) { "Bybit execute signal failed: ${signal.id}" }
-            Result.success(
-                OrderExecution(
-                    signalId = signal.id,
-                    status = ExecutionStatus.FAILED,
-                    errorMessage = e.message
-                )
-            )
+            Result.failure(e)
         }
     }
 

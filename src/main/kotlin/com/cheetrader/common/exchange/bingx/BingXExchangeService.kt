@@ -163,6 +163,21 @@ class BingXExchangeService(
                 val conditionalErrors = mutableListOf<String>()
                 val closeSide = if (isBuy) BingXConstants.SIDE_SELL else BingXConstants.SIDE_BUY
 
+                // Track placement outcomes so the client can warn the user about
+                // unprotected positions. On BingX, SL (and single TP) are embedded
+                // in the main order — if `placeOrder` succeeded and had SL config,
+                // the SL is assumed placed together with the entry. We cannot
+                // independently verify embedded-order placement without a separate
+                // open-orders query, which is out of scope for this change.
+                //
+                // `hasTakeProfit` starts optimistic and is flipped to `false` if
+                // any explicit TP order placement fails (multi-TP path or trailing).
+                val hasStopLoss = true
+                val requestedSingleTp = multiTp == null && safeTp != null
+                val hasMultiTp = multiTp != null
+                val trailingParams = extractTrailingParams(signal.metadata)
+                var hasTakeProfit = true
+
                 // Multi-stage take-profit orders
                 if (multiTp != null) {
                     val precision = quantity.scale()
@@ -174,19 +189,31 @@ class BingXExchangeService(
 
                     if (tp1Qty > BigDecimal.ZERO && tp2Qty > BigDecimal.ZERO) {
                         val tp1Result = placeTpAlgoOrder(symbol, closeSide, positionSide, multiTp.tp1, tp1Qty)
-                        if (tp1Result.isFailure) conditionalErrors.add("TP1: ${tp1Result.exceptionOrNull()?.message}")
+                        if (tp1Result.isFailure) {
+                            conditionalErrors.add("TP1: ${tp1Result.exceptionOrNull()?.message}")
+                            hasTakeProfit = false
+                        }
 
                         val tp2Result = placeTpAlgoOrder(symbol, closeSide, positionSide, multiTp.tp2, tp2Qty)
-                        if (tp2Result.isFailure) conditionalErrors.add("TP2: ${tp2Result.exceptionOrNull()?.message}")
+                        if (tp2Result.isFailure) {
+                            conditionalErrors.add("TP2: ${tp2Result.exceptionOrNull()?.message}")
+                            hasTakeProfit = false
+                        }
 
                         if (multiTp.tp3 != null && tp3Qty > BigDecimal.ZERO) {
                             val tp3Result = placeTpAlgoOrder(symbol, closeSide, positionSide, multiTp.tp3, tp3Qty)
-                            if (tp3Result.isFailure) conditionalErrors.add("TP3: ${tp3Result.exceptionOrNull()?.message}")
+                            if (tp3Result.isFailure) {
+                                conditionalErrors.add("TP3: ${tp3Result.exceptionOrNull()?.message}")
+                                hasTakeProfit = false
+                            }
                         }
                     } else {
                         // Fallback: quantities too small, place single TP
                         val tpResult = placeTpAlgoOrder(symbol, closeSide, positionSide, multiTp.tp1, quantity)
-                        if (tpResult.isFailure) conditionalErrors.add("TP: ${tpResult.exceptionOrNull()?.message}")
+                        if (tpResult.isFailure) {
+                            conditionalErrors.add("TP: ${tpResult.exceptionOrNull()?.message}")
+                            hasTakeProfit = false
+                        }
                     }
 
                     // TODO: Break-even after TP1/TP2 requires a PositionMonitorService that watches
@@ -198,8 +225,7 @@ class BingXExchangeService(
                     // signal.metadata are snapshots at signal time.
                 }
 
-                // Trailing stop from metadata
-                val trailingParams = extractTrailingParams(signal.metadata)
+                // Trailing stop from metadata (parsed once above)
                 if (trailingParams != null) {
                     val trailingSide = if (isBuy) BingXConstants.SIDE_SELL else BingXConstants.SIDE_BUY
                     val trailingResult = placeTrailingStopWithRecalc(
@@ -213,7 +239,25 @@ class BingXExchangeService(
                     )
                     if (trailingResult.isFailure) {
                         conditionalErrors.add("Trailing: ${trailingResult.exceptionOrNull()?.message}")
+                        // Trailing replaces TP as the profit-exit — if it failed and
+                        // no TP was placed, the position has no profit-exit.
+                        if (!requestedSingleTp && !hasMultiTp) hasTakeProfit = false
                     }
+                }
+
+                // Verify the position actually opened on the exchange. BingX occasionally
+                // accepts an order (returns success + orderId) without the position
+                // materialising — we must not mark such a signal as SUCCESS/PARTIAL or
+                // the client will render a ghost ActiveTrade that doesn't exist on-exchange.
+                val opened = verifyPositionOpened(symbol, positionSide)
+                if (!opened) {
+                    logger.error {
+                        "BingX order ${orderData.orderId} accepted but position not found " +
+                                "after verify (symbol=$symbol side=$positionSide) — treating as FAILED"
+                    }
+                    return Result.failure(BingXException(
+                        "Order ${orderData.orderId} accepted by BingX but position did not appear on exchange"
+                    ))
                 }
 
                 val status = if (conditionalErrors.isNotEmpty()) {
@@ -227,24 +271,26 @@ class BingXExchangeService(
                     signalId = signal.id,
                     status = status,
                     exchangeOrderId = orderData.orderId,
-                    executedPrice = orderData.price?.toDoubleOrNull(),
-                    executedQuantity = orderData.quantity?.toDoubleOrNull(),
-                    errorMessage = conditionalErrors.takeIf { it.isNotEmpty() }?.joinToString("; ")
+                    // Filter out BingX's "0" placeholder avgPrice/qty — these arrive when
+                    // a market order hasn't settled its fill price yet. Surfacing 0.0 as
+                    // "executed price" breaks PnL and dashboard math downstream.
+                    executedPrice = orderData.price?.toDoubleOrNull()?.takeIf { it > 0.0 },
+                    executedQuantity = orderData.quantity?.toDoubleOrNull()?.takeIf { it > 0.0 },
+                    errorMessage = conditionalErrors.takeIf { it.isNotEmpty() }?.joinToString("; "),
+                    hasExchangeStopLoss = hasStopLoss,
+                    hasExchangeTakeProfit = hasTakeProfit
                 ))
             } else {
-                Result.success(OrderExecution(
-                    signalId = signal.id,
-                    status = ExecutionStatus.FAILED,
-                    errorMessage = result.exceptionOrNull()?.message
-                ))
+                // Propagate the real exception so the caller's Result.onFailure /
+                // getOrElse branch actually fires. Wrapping failure inside
+                // Result.success(FAILED) silently swallowed every BingX error and
+                // caused the "silent success" class of bugs.
+                Result.failure(result.exceptionOrNull()
+                    ?: BingXException("Order placement failed (no error detail)"))
             }
         } catch (e: Exception) {
             logger.error(e) { "Failed to execute signal ${signal.id}" }
-            Result.success(OrderExecution(
-                signalId = signal.id,
-                status = ExecutionStatus.FAILED,
-                errorMessage = e.message
-            ))
+            Result.failure(e)
         }
     }
 
@@ -387,6 +433,28 @@ class BingXExchangeService(
     }
 
     // ===== Private Methods =====
+
+    /**
+     * Verify that the position is actually visible on the exchange after placement.
+     * BingX V2 API can return SUCCESS + orderId while the position fails to
+     * materialise (reasons vary: margin check, symbol config, stale leverage setting).
+     * Without this check the client happily tracks a ghost ActiveTrade that does
+     * not exist on-exchange. We retry twice with a 1s gap to tolerate settlement delay.
+     */
+    private suspend fun verifyPositionOpened(symbol: String, positionSide: String): Boolean {
+        val maxAttempts = 2
+        repeat(maxAttempts) {
+            delay(1000)
+            val positions = getOpenPositions().getOrNull()
+            if (positions != null) {
+                val match = positions.any { pos ->
+                    pos.symbol == symbol && pos.side.equals(positionSide, ignoreCase = true) && pos.size > 0.0
+                }
+                if (match) return true
+            }
+        }
+        return false
+    }
 
     private suspend fun placeOrder(order: BingXOrderRequest): Result<BingXOrderData> {
         val maxRetries = 3

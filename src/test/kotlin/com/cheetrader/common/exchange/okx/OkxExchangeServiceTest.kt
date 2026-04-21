@@ -112,7 +112,10 @@ class OkxExchangeServiceTest {
     }
 
     @Test
-    fun `executeSignal order fails returns FAILED`() = runTest {
+    fun `executeSignal order rejected propagates Result failure`() = runTest {
+        // Previously this returned Result.success(OrderExecution(FAILED, ...)) which
+        // caused silent-success bugs in callers using .getOrElse{}. Now OKX
+        // propagates the exception (Package A anti-pattern fix).
         val signal = TestSignals.longBtc()
 
         mock.enqueue(OkxResponses.balance(1000.0))
@@ -124,8 +127,10 @@ class OkxExchangeServiceTest {
         mock.enqueue(OkxResponses.orderRejected("51000", "Insufficient balance"))
 
         val result = service.executeSignal(signal, 5.0)
-        assertTrue(result.isSuccess)
-        assertEquals(ExecutionStatus.FAILED, result.getOrThrow().status)
+        assertTrue(result.isFailure, "order rejection must surface as Result.failure")
+        val ex = result.exceptionOrNull()
+        assertNotNull(ex)
+        assertTrue(ex is OkxException, "exception must carry OKX error detail")
     }
 
     @Test

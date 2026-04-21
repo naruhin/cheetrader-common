@@ -159,7 +159,13 @@ data class OrderExecution(
     val executedPrice: Double? = null,
     val executedQuantity: Double? = null,
     val executedAt: Long = System.currentTimeMillis(),
-    val errorMessage: String? = null
+    val errorMessage: String? = null,
+    // Protection-status flags: surface to the UI when an exchange-side SL or TP
+    // was requested but NOT placed, so the user can intervene. Default `true`
+    // means "protection is in place" (or "was never requested") — safe default
+    // for exchange adapters that don't explicitly track placement outcomes.
+    val hasExchangeStopLoss: Boolean = true,
+    val hasExchangeTakeProfit: Boolean = true
 ) {
     val formattedTime: String
         get() = LocalDateTime.ofInstant(

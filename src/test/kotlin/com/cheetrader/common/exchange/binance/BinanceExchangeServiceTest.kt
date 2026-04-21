@@ -151,7 +151,10 @@ class BinanceExchangeServiceTest {
     }
 
     @Test
-    fun `executeSignal order fails returns FAILED`() = runTest {
+    fun `executeSignal order rejected propagates Result failure`() = runTest {
+        // Previously this returned Result.success(OrderExecution(FAILED, ...)) which
+        // caused silent-success bugs in callers using .getOrElse{}. Now Binance
+        // propagates the exception (Package A anti-pattern fix).
         val signal = TestSignals.longBtc()
 
         mock.enqueue(BinanceResponses.serverTime())
@@ -165,8 +168,10 @@ class BinanceExchangeServiceTest {
         mock.enqueue(BinanceResponses.apiError(-1100, "Illegal character"))
 
         val result = service.executeSignal(signal, 5.0)
-        assertTrue(result.isSuccess)
-        assertEquals(ExecutionStatus.FAILED, result.getOrThrow().status)
+        assertTrue(result.isFailure, "order rejection must surface as Result.failure")
+        val ex = result.exceptionOrNull()
+        assertNotNull(ex)
+        assertTrue(ex is BinanceException, "exception must carry Binance error detail")
     }
 
     @Test
