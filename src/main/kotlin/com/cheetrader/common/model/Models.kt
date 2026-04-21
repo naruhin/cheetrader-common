@@ -165,7 +165,15 @@ data class OrderExecution(
     // means "protection is in place" (or "was never requested") — safe default
     // for exchange adapters that don't explicitly track placement outcomes.
     val hasExchangeStopLoss: Boolean = true,
-    val hasExchangeTakeProfit: Boolean = true
+    val hasExchangeTakeProfit: Boolean = true,
+    // Package C.2 — exchange-side protection order IDs captured during placement.
+    // Empty / null when the exchange embeds the order in the main entry (e.g.
+    // BingX single-TP, Bybit positional SL/TP) or doesn't return a separate ID.
+    // Gateway persists these so close events can be traced back to the originating
+    // signal in Package D / G.
+    val slOrderId: String? = null,
+    val tpOrderIds: List<String> = emptyList(),
+    val trailingOrderId: String? = null
 ) {
     val formattedTime: String
         get() = LocalDateTime.ofInstant(
