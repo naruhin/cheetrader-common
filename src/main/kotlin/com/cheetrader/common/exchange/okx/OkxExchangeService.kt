@@ -305,6 +305,11 @@ class OkxExchangeService(
 
     private suspend fun fetchOrderFill(instId: String, orderId: String): OrderFillInfo? {
         val delays = longArrayOf(150L, 300L, 600L)
+        // Phase-1 hotfix (Bug B — 2026-04-21): `accFillSz` is in CONTRACTS,
+        // same as `pos` in getOpenPositions. Normalize to base-asset units by
+        // multiplying by ctVal so downstream PnL/fee math stays correct. See
+        // getOpenPositions comment for the broader context.
+        val ctVal = getInstrumentInfo(instId)?.ctVal?.toDouble() ?: 1.0
         for ((attempt, d) in delays.withIndex()) {
             try {
                 kotlinx.coroutines.delay(d)
@@ -325,10 +330,11 @@ class OkxExchangeService(
                     ?.takeIf { it.isNotBlank() }
                     ?.toDoubleOrNull()
                     ?.takeIf { it > 0.0 }
-                val accSz = data["accFillSz"]?.jsonPrimitive?.content
+                val accSzContracts = data["accFillSz"]?.jsonPrimitive?.content
                     ?.takeIf { it.isNotBlank() }
                     ?.toDoubleOrNull()
                     ?.takeIf { it > 0.0 }
+                val accSz = accSzContracts?.times(ctVal)
 
                 if (avgPx != null && accSz != null) {
                     return OrderFillInfo(avgPx, accSz)
@@ -425,10 +431,28 @@ class OkxExchangeService(
 
             val obj = json.parseToJsonElement(response).jsonObject
             val data = obj["data"]?.jsonArray ?: JsonArray(emptyList())
-            val result = data.mapNotNull { item ->
+            // Phase-1 P0 hotfix (Bug B — 2026-04-21): OKX `pos` field is in
+            // CONTRACTS, not base asset units. For BTC-USDT-SWAP one contract
+            // represents 0.01 BTC (`ctVal` from /public/instruments). Other
+            // exchanges return size in base asset directly. To keep the common
+            // contract [ExchangePosition.size] = base-asset-units consistent
+            // across adapters, we multiply by `ctVal` here before returning.
+            // Without this fix, every downstream `notional = entry * size`
+            // calc (fees, PnL, risk check) was 100× off for BTC-USDT-SWAP —
+            // phantom fees then flipped unrealized +$4 into recorded −$104.
+            // Uses the same cached `getInstrumentInfo` the entry path uses,
+            // so hot positions need no extra network call.
+            val result = mutableListOf<ExchangePosition>()
+            for (item in data) {
                 val pos = item.jsonObject
                 val posSize = pos["pos"]?.jsonPrimitive?.content?.toDoubleOrNull() ?: 0.0
-                if (posSize == 0.0) return@mapNotNull null
+                if (posSize == 0.0) continue
+
+                val instId = pos["instId"]?.jsonPrimitive?.content ?: continue
+                // Fail-safe: if instrument lookup fails (rare — cached), use
+                // 1.0 so the position is still visible rather than dropped.
+                // PnL will be wrong in that case, but the user sees the trade.
+                val ctVal = getInstrumentInfo(instId)?.ctVal?.toDouble() ?: 1.0
 
                 val posSide = pos["posSide"]?.jsonPrimitive?.content ?: "net"
                 val side = when {
@@ -438,21 +462,23 @@ class OkxExchangeService(
                     else -> "SHORT"
                 }
 
-                ExchangePosition(
-                    // Denormalize OKX-native instId → universal symbol. Without
-                    // this, ActiveTrade.symbol gets overwritten by the polling
-                    // path with "BTC-USDT-SWAP" which the dashboard truncates
-                    // to "BTC-" (live regression 2026-04-21).
-                    symbol = pos["instId"]?.jsonPrimitive?.content
-                        ?.let(::denormalizeSymbol) ?: return@mapNotNull null,
-                    side = side,
-                    size = kotlin.math.abs(posSize),
-                    entryPrice = pos["avgPx"]?.jsonPrimitive?.content?.toDoubleOrNull() ?: 0.0,
-                    markPrice = pos["markPx"]?.jsonPrimitive?.content?.toDoubleOrNull() ?: 0.0,
-                    unrealizedPnl = pos["upl"]?.jsonPrimitive?.content?.toDoubleOrNull() ?: 0.0,
-                    leverage = pos["lever"]?.jsonPrimitive?.content?.toDoubleOrNull()?.toInt() ?: 1,
-                    margin = pos["margin"]?.jsonPrimitive?.content?.toDoubleOrNull() ?: 0.0,
-                    liquidationPrice = pos["liqPx"]?.jsonPrimitive?.content?.toDoubleOrNull()
+                result.add(
+                    ExchangePosition(
+                        // Denormalize OKX-native instId → universal symbol. Without
+                        // this, ActiveTrade.symbol gets overwritten by the polling
+                        // path with "BTC-USDT-SWAP" which the dashboard truncates
+                        // to "BTC-" (live regression 2026-04-21).
+                        symbol = denormalizeSymbol(instId),
+                        side = side,
+                        // size in base asset units (Bug B fix — multiplied by ctVal)
+                        size = kotlin.math.abs(posSize) * ctVal,
+                        entryPrice = pos["avgPx"]?.jsonPrimitive?.content?.toDoubleOrNull() ?: 0.0,
+                        markPrice = pos["markPx"]?.jsonPrimitive?.content?.toDoubleOrNull() ?: 0.0,
+                        unrealizedPnl = pos["upl"]?.jsonPrimitive?.content?.toDoubleOrNull() ?: 0.0,
+                        leverage = pos["lever"]?.jsonPrimitive?.content?.toDoubleOrNull()?.toInt() ?: 1,
+                        margin = pos["margin"]?.jsonPrimitive?.content?.toDoubleOrNull() ?: 0.0,
+                        liquidationPrice = pos["liqPx"]?.jsonPrimitive?.content?.toDoubleOrNull()
+                    )
                 )
             }
             Result.success(result)
@@ -475,6 +501,14 @@ class OkxExchangeService(
     ): Result<List<ExchangeFill>> {
         return try {
             val instId = convertSymbol(symbol)
+            // Phase-1 hotfix (Bug B — 2026-04-21): `fillSz` is in CONTRACTS
+            // on OKX swaps. Normalize by ctVal so the returned
+            // [ExchangeFill.quantity] matches the base-asset convention used
+            // by every other exchange adapter (Binance / Bybit / BingX).
+            // Package D's `resolveCloseReasonFromFills` compares quantities
+            // across adapters — inconsistent units there would break close
+            // attribution silently.
+            val ctVal = getInstrumentInfo(instId)?.ctVal?.toDouble() ?: 1.0
             val params = mutableMapOf(
                 "instType" to "SWAP",
                 "instId" to instId,
@@ -496,7 +530,8 @@ class OkxExchangeService(
                 val ordId = rec["ordId"]?.jsonPrimitive?.content ?: return@mapNotNull null
                 val side = rec["side"]?.jsonPrimitive?.content?.uppercase() ?: return@mapNotNull null
                 val price = rec["fillPx"]?.jsonPrimitive?.content?.toDoubleOrNull() ?: return@mapNotNull null
-                val qty = rec["fillSz"]?.jsonPrimitive?.content?.toDoubleOrNull() ?: return@mapNotNull null
+                val qtyContracts = rec["fillSz"]?.jsonPrimitive?.content?.toDoubleOrNull() ?: return@mapNotNull null
+                val qty = qtyContracts * ctVal
                 val time = rec["ts"]?.jsonPrimitive?.content?.toLongOrNull() ?: 0L
                 val pnl = rec["fillPnl"]?.jsonPrimitive?.content?.toDoubleOrNull()
                 // OKX execType: "T" = taker open, "M" = maker open, "C" = close.

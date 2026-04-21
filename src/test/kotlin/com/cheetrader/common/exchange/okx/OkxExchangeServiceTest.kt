@@ -209,6 +209,9 @@ class OkxExchangeServiceTest {
     @Test
     fun `getOpenPositionsCount success`() = runTest {
         mock.enqueue(OkxResponses.positions("BTC-USDT-SWAP", 1.0, "long"))
+        // Bug B hotfix (2026-04-21): getOpenPositions now normalizes size
+        // by ctVal, which requires an instrument lookup per position.
+        mock.enqueue(OkxResponses.instrument("BTC-USDT-SWAP", "0.01", "1", "1"))
 
         val result = service.getOpenPositionsCount()
         assertTrue(result.isSuccess)
@@ -314,6 +317,9 @@ class OkxExchangeServiceTest {
 
     @Test
     fun `getRecentFills maps execType C to isReduceOnly true`() = runTest {
+        // Bug B hotfix (2026-04-21): getRecentFills now normalizes fillSz
+        // by ctVal — instrument lookup happens first.
+        mock.enqueue(OkxResponses.instrument("BTC-USDT-SWAP", "0.01", "1", "1"))
         mock.enqueue(
             OkxResponses.fillsHistory(
                 mapOf("orderId" to "open-1", "side" to "buy", "price" to "65000", "qty" to "1", "time" to "100", "execType" to "T"),
@@ -337,10 +343,49 @@ class OkxExchangeServiceTest {
 
     @Test
     fun `getRecentFills empty data returns empty list`() = runTest {
+        // Bug B hotfix: instrument lookup is now unconditional on the fills path.
+        mock.enqueue(OkxResponses.instrument("BTC-USDT-SWAP", "0.01", "1", "1"))
         mock.enqueue(OkxResponses.fillsHistory())
 
         val result = service.getRecentFills("BTCUSDT", sinceMs = 0L, limit = 50)
         assertTrue(result.isSuccess)
         assertTrue(result.getOrThrow().isEmpty())
+    }
+
+    // Bug B regression coverage (2026-04-21): OKX `pos` / `fillSz` are in
+    // contracts — for BTC-USDT-SWAP 1 contract = 0.01 BTC. The common contract
+    // across adapters is base-asset units, so [ExchangePosition.size] and
+    // [ExchangeFill.quantity] must be normalized by ctVal. Without this, the
+    // downstream `notional = entry * size` calc was 100× wrong on OKX and
+    // phantom fees flipped unrealized +$4 into recorded −$104 in prod.
+
+    @Test
+    fun `getOpenPositions multiplies size by ctVal to return base asset units`() = runTest {
+        // 10 contracts of BTC-USDT-SWAP at ctVal=0.01 should surface as 0.10 BTC.
+        mock.enqueue(OkxResponses.positions("BTC-USDT-SWAP", 10.0, "long"))
+        mock.enqueue(OkxResponses.instrument("BTC-USDT-SWAP", "0.01", "1", "1"))
+
+        val result = service.getOpenPositions()
+        assertTrue(result.isSuccess)
+        val positions = result.getOrThrow()
+        assertEquals(1, positions.size)
+        assertEquals(0.10, positions[0].size, 1e-9)
+        assertEquals("BTCUSDT", positions[0].symbol)
+    }
+
+    @Test
+    fun `getRecentFills multiplies fillSz by ctVal to return base asset units`() = runTest {
+        mock.enqueue(OkxResponses.instrument("BTC-USDT-SWAP", "0.01", "1", "1"))
+        mock.enqueue(
+            OkxResponses.fillsHistory(
+                mapOf("orderId" to "x", "side" to "buy", "price" to "65000", "qty" to "5", "time" to "100", "execType" to "T")
+            )
+        )
+
+        val result = service.getRecentFills("BTCUSDT", sinceMs = 0L, limit = 50)
+        val fills = result.getOrThrow()
+        assertEquals(1, fills.size)
+        // 5 contracts × 0.01 ctVal = 0.05 BTC
+        assertEquals(0.05, fills[0].quantity, 1e-9)
     }
 }
