@@ -198,10 +198,97 @@ class OkxExchangeServiceTest {
         mock.enqueue(OkxResponses.ticker(65000.0))
         mock.enqueue(OkxResponses.orderSuccess())
         mock.enqueue(OkxResponses.apiError(50000, "Trailing failed"))
+        // placeTrailingStopAlgoWithRecalc retries: attempt 2 needs a ticker
+        // (getMarketPrice) + another algo attempt; attempt 3 one more algo.
+        // Provide benign apiError responses so the retry path completes fast
+        // instead of hanging on mock-queue exhaustion.
+        mock.enqueue(OkxResponses.apiError(50000, "no market"))
+        mock.enqueue(OkxResponses.apiError(50000, "Trailing failed attempt 2"))
+        mock.enqueue(OkxResponses.apiError(50000, "Trailing failed attempt 3"))
+        // fetchOrderFill — 3 retries (mock returns apiError, treated as "not
+        // yet filled" and advances to next retry) + 1 getOpenPositions
+        // fallback added by Bug #2 fix (2026-04-22).
+        mock.enqueue(OkxResponses.apiError(50000, "not yet filled"))
+        mock.enqueue(OkxResponses.apiError(50000, "not yet filled"))
+        mock.enqueue(OkxResponses.apiError(50000, "not yet filled"))
+        mock.enqueue(OkxResponses.positionsEmpty())
 
         val result = service.executeSignal(signal, 5.0)
         assertTrue(result.isSuccess)
         assertEquals(ExecutionStatus.PARTIAL, result.getOrThrow().status)
+    }
+
+    @Test
+    fun `executeSignal falls back to getOpenPositions when avgPx not settled`() = runTest {
+        // Bug #2 (2026-04-22): on OKX demo, market orders can take longer than
+        // the 3-retry fetchOrderFill window to settle avgPx/accFillSz. Without
+        // the getOpenPositions fallback, OrderExecution would ship with
+        // executedPrice=null / executedQuantity=null — downstream Package A
+        // ghost-trade guard then refuses to create an ActiveTrade, leaving a
+        // live on-exchange position invisible on the dashboard. The fallback
+        // pulls price + size from the settled position snapshot.
+        val signal = TestSignals.longBtc(tp = 70000.0, sl = 60000.0)
+
+        mock.enqueue(OkxResponses.balance(1000.0))
+        mock.enqueue(OkxResponses.accountConfig("long_short_mode", 2))
+        mock.enqueue(OkxResponses.leverageSuccess())
+        mock.enqueue(OkxResponses.leverageSuccess())
+        mock.enqueue(OkxResponses.instrument("BTC-USDT-SWAP", "0.01", "1", "1"))
+        mock.enqueue(OkxResponses.ticker(65000.0))
+        mock.enqueue(OkxResponses.orderSuccess("okx-order-fill-slow"))
+        // fetchOrderFill 3 retries — OKX's "not yet filled" sentinel (empty
+        // avgPx/accFillSz strings, code=0).
+        val notFilled = """{"code":"0","msg":"","data":[{"ordId":"okx-order-fill-slow","avgPx":"","accFillSz":""}]}"""
+        mock.enqueue(notFilled)
+        mock.enqueue(notFilled)
+        mock.enqueue(notFilled)
+        // Fallback getOpenPositions: settled position with entry 65001.23,
+        // size 10 contracts × ctVal 0.01 = 0.10 BTC base-asset units.
+        mock.enqueue(
+            """{"code":"0","msg":"","data":[{"instId":"BTC-USDT-SWAP","pos":"10","posSide":"long","avgPx":"65001.23","markPx":"65005","upl":"0","lever":"20","margin":"","liqPx":""}]}"""
+        )
+
+        val result = service.executeSignal(signal, 5.0)
+        assertTrue(result.isSuccess, "executeSignal must succeed via fallback")
+        val exec = result.getOrThrow()
+        assertEquals(ExecutionStatus.SUCCESS, exec.status)
+        assertEquals("okx-order-fill-slow", exec.exchangeOrderId)
+        assertEquals(65001.23, exec.executedPrice!!, 0.01)
+        // getOpenPositions already multiplied by ctVal — fallback MUST NOT
+        // multiply again. 10 contracts * 0.01 ctVal = 0.10 base units.
+        assertEquals(0.10, exec.executedQuantity!!, 1e-9)
+    }
+
+    @Test
+    fun `executeSignal leaves executedPrice null when fallback position missing`() = runTest {
+        // If the order truly didn't place (or placed and was auto-cancelled by
+        // the exchange before we can query), the fallback must return null so
+        // the downstream ghost-trade guard correctly rejects the OrderExecution.
+        val signal = TestSignals.longBtc(tp = 70000.0, sl = 60000.0)
+
+        mock.enqueue(OkxResponses.balance(1000.0))
+        mock.enqueue(OkxResponses.accountConfig("long_short_mode", 2))
+        mock.enqueue(OkxResponses.leverageSuccess())
+        mock.enqueue(OkxResponses.leverageSuccess())
+        mock.enqueue(OkxResponses.instrument("BTC-USDT-SWAP", "0.01", "1", "1"))
+        mock.enqueue(OkxResponses.ticker(65000.0))
+        mock.enqueue(OkxResponses.orderSuccess("okx-order-ghost"))
+        val notFilled = """{"code":"0","msg":"","data":[{"ordId":"okx-order-ghost","avgPx":"","accFillSz":""}]}"""
+        mock.enqueue(notFilled)
+        mock.enqueue(notFilled)
+        mock.enqueue(notFilled)
+        mock.enqueue(OkxResponses.positionsEmpty())
+
+        val result = service.executeSignal(signal, 5.0)
+        assertTrue(result.isSuccess)
+        val exec = result.getOrThrow()
+        // Status is SUCCESS because the order was placed (orderId returned) —
+        // but the downstream ViewModel ghost-trade guard will reject it as an
+        // ActiveTrade because executedQuantity is null.
+        assertEquals(ExecutionStatus.SUCCESS, exec.status)
+        assertEquals("okx-order-ghost", exec.exchangeOrderId)
+        assertEquals(null, exec.executedPrice)
+        assertEquals(null, exec.executedQuantity)
     }
 
     // ===== getOpenPositionsCount =====

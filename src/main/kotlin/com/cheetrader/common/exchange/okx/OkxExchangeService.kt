@@ -344,8 +344,43 @@ class OkxExchangeService(
                 logger.warn { "OKX fetch-order-fill attempt ${attempt + 1} failed for $orderId: ${e.message}" }
             }
         }
-        logger.warn { "OKX order $orderId has no avgPx after ${delays.size} retries — executedPrice left null" }
-        return null
+
+        // Fallback — `/trade/order` never returned filled avgPx/accFillSz within the
+        // retry window. Bug #2 (2026-04-22): on OKX demo BTC market orders,
+        // settlement can take longer than our 1050 ms window, so OrderExecution
+        // gets shipped with executedPrice=null/executedQuantity=null despite a
+        // valid orderId. Downstream client guards (Package A ghost-trade check)
+        // then REFUSE to create an ActiveTrade → the position is live on-exchange
+        // but invisible on the dashboard. Fall back to `/account/positions` which
+        // reports the settled avg-entry-price + current size for the live
+        // position. This is authoritative: if there's no matching position, the
+        // order truly didn't fill and we propagate null up so the guard correctly
+        // rejects a ghost.
+        //
+        // withTimeoutOrNull caps the total fallback latency — if the exchange
+        // is slow or the position endpoint blocks, we give up rather than
+        // extending executeSignal's wall-clock indefinitely.
+        logger.info { "OKX order $orderId: avgPx retries exhausted — falling back to getOpenPositions" }
+        return try {
+            kotlinx.coroutines.delay(500L)
+            val positions = getOpenPositions().getOrNull().orEmpty()
+            val pos = positions.firstOrNull { convertSymbol(it.symbol) == instId }
+            if (pos == null || pos.size <= 0.0 || pos.entryPrice <= 0.0) {
+                logger.warn { "OKX order $orderId has no matching position — executedPrice left null" }
+                null
+            } else {
+                // pos.size is ALREADY in base-asset units (getOpenPositions
+                // multiplies by ctVal there), so we pass it through as-is —
+                // do NOT multiply again.
+                logger.info {
+                    "OKX order $orderId: using position snapshot avgPx=${pos.entryPrice} size=${pos.size}"
+                }
+                OrderFillInfo(avgPx = pos.entryPrice, accFillSz = pos.size)
+            }
+        } catch (e: Exception) {
+            logger.warn { "OKX order $orderId fallback position lookup failed: ${e.message}" }
+            null
+        }
     }
 
     override suspend fun closePosition(symbol: String): Result<OrderExecution> {
