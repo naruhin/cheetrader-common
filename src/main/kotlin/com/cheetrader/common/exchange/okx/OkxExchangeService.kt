@@ -634,8 +634,13 @@ class OkxExchangeService(
     private suspend fun cancelAlgoOrders(instId: String) {
         try {
             val algoIds = getPendingAlgoOrders(instId)
-            if (algoIds.isEmpty()) return
+            if (algoIds.isEmpty()) {
+                logger.debug { "OKX cancelAlgoOrders: no pending algo orders for $instId" }
+                return
+            }
 
+            logger.info { "OKX cancelAlgoOrders: attempting to cancel ${algoIds.size} algo orders for $instId" }
+            var cancelled = 0
             val chunks = algoIds.chunked(20)
             for (chunk in chunks) {
                 val body = buildJsonArray {
@@ -653,29 +658,60 @@ class OkxExchangeService(
                 if (response != null) {
                     val error = parseError(response)
                     if (error != null) {
-                        logger.warn { "OKX cancel algo orders warning: ${error.message}" }
+                        logger.warn { "OKX cancelAlgoOrders: chunk failed — ${error.message}" }
+                    } else {
+                        cancelled += chunk.size
                     }
                 }
             }
+            logger.info { "OKX cancelAlgoOrders: cancelled $cancelled / ${algoIds.size} algo orders for $instId" }
         } catch (e: Exception) {
-            logger.warn { "OKX cancel algo orders warning: ${e.message}" }
+            logger.warn { "OKX cancelAlgoOrders: unexpected error — ${e.message}" }
         }
     }
 
+    /**
+     * Queries pending algo orders across all types we might have placed.
+     *
+     * Patch 6 (2026-04-23): iterate per ordType instead of a single
+     * comma-joined filter. Live OKX-demo test showed SL+trailing orders
+     * remaining after manual close; root cause was our filter missing
+     * ordType="oco" — single-TP mode places SL+TP via `attachAlgoOrds`
+     * with BOTH `slTriggerPx` and `tpTriggerPx`, which OKX materialises
+     * as an OCO (one-cancels-other) algo. The previous
+     * `"conditional,move_order_stop"` filter missed this entirely.
+     *
+     * Also added "trigger" for defensive coverage (not actively placed
+     * by our code today, but a user migrating from another client might
+     * have one; safer to include).
+     *
+     * One API call per type: ~200-400 ms × 4 = ~1 s in the pathological
+     * case. Only runs on manual close, not a hot path.
+     */
     private suspend fun getPendingAlgoOrders(instId: String): List<String> {
-        val response = httpClient.executeSignedGet(
-            OkxConstants.Endpoints.ORDERS_ALGO_PENDING,
-            mapOf("instId" to instId, "ordType" to "conditional,move_order_stop")
-        ) ?: return emptyList()
+        val types = listOf("conditional", "oco", "trigger", "move_order_stop")
+        val allIds = mutableListOf<String>()
+        for (type in types) {
+            val response = httpClient.executeSignedGet(
+                OkxConstants.Endpoints.ORDERS_ALGO_PENDING,
+                mapOf("instId" to instId, "ordType" to type)
+            ) ?: continue
 
-        val error = parseError(response)
-        if (error != null) return emptyList()
+            val error = parseError(response)
+            if (error != null) {
+                logger.warn { "OKX getPendingAlgoOrders: type=$type failed — ${error.message}" }
+                continue
+            }
 
-        val obj = json.parseToJsonElement(response).jsonObject
-        val data = obj["data"]?.jsonArray ?: JsonArray(emptyList())
-        return data.mapNotNull { item ->
-            item.jsonObject["algoId"]?.jsonPrimitive?.content
+            val obj = json.parseToJsonElement(response).jsonObject
+            val data = obj["data"]?.jsonArray ?: JsonArray(emptyList())
+            val ids = data.mapNotNull { it.jsonObject["algoId"]?.jsonPrimitive?.content }
+            if (ids.isNotEmpty()) {
+                logger.info { "OKX getPendingAlgoOrders: found ${ids.size} $type orders for $instId" }
+                allIds += ids
+            }
         }
+        return allIds
     }
 
     private suspend fun setLeverage(instId: String, posSide: String?) {
