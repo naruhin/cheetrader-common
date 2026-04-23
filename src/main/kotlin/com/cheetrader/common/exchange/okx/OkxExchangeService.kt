@@ -36,6 +36,26 @@ class OkxExchangeService(
     baseUrlOverride: String? = null
 ) : ExchangeService {
 
+    companion object {
+        /**
+         * Base symbols (e.g. `SHIB`) for tokens that Binance futures lists
+         * with a `1000X` multiplier prefix but OKX lists per-unit. When one
+         * of these is seen — either in a signal symbol like `1000SHIBUSDT`
+         * or in an OKX instId like `SHIB-USDT-SWAP` — the adapter applies
+         * a 1000× conversion at its boundary so the rest of the system can
+         * treat signal-convention prices and quantities uniformly.
+         *
+         * Keep narrow. Add new tokens only when strategies actually trade
+         * them, to avoid false positives on 3-4 letter tickers that happen
+         * to share prefixes. Current list reflects what live Binance futures
+         * offers as `1000XUSDT` as of 2026-04.
+         */
+        internal val OKX_SCALED_1000X_BASES = setOf(
+            "SHIB", "PEPE", "BONK", "FLOKI", "LUNC", "SATS",
+            "RATS", "CAT", "CHEEMS", "XEC", "X", "TOSHI"
+        )
+    }
+
     override val name = "OKX"
 
     private val baseUrl = baseUrlOverride ?: "https://www.okx.com"
@@ -124,6 +144,18 @@ class OkxExchangeService(
             val balance = balanceResult.getOrThrow()
 
             val instId = convertSymbol(signal.symbol)
+            // 1000X catastrophe fix (2026-04-23): Binance-convention signal
+            // prices (`1000SHIBUSDT @ 0.006`) must be divided by 1000 when
+            // placed on OKX, which trades the underlying at `0.000006` per
+            // SHIB. Applied uniformly to entry, SL, TP, multi-TP tiers, and
+            // trailing trigger. Factor = 1.0 for non-scaled symbols so this
+            // is a no-op for BTC/ETH/etc. See [signalScalingFactor] + the
+            // [OKX_SCALED_1000X_BASES] whitelist.
+            val scale = signalScalingFactor(signal.symbol)
+            val signalEntry = signal.entryPrice / scale
+            val signalSl = signal.stopLoss?.let { it / scale }
+            val signalTp = signal.takeProfit?.let { it / scale }
+
             val isBuy = signal.type == SignalType.LONG
             val side = if (isBuy) OkxConstants.SIDE_BUY else OkxConstants.SIDE_SELL
             val posSide = if (getPositionMode() == OkxConstants.POS_MODE_LONG_SHORT) {
@@ -147,7 +179,11 @@ class OkxExchangeService(
             }
 
             val tradeAmount = balance * (balancePercent / 100.0) * defaultLeverage
-            val quantity = calculateContractQuantity(tradeAmount, signal.entryPrice, instrumentInfo)
+            // calculateContractQuantity divides by price×ctVal → pass OKX-side
+            // price so contracts = notional / (okxPrice × ctVal). With the
+            // scale fix above, this now produces ~1000× more contracts for
+            // a 1000X symbol, matching the intended notional.
+            val quantity = calculateContractQuantity(tradeAmount, signalEntry, instrumentInfo)
             if (quantity <= BigDecimal.ZERO) {
                 return Result.success(
                     OrderExecution(
@@ -158,32 +194,50 @@ class OkxExchangeService(
                 )
             }
 
-            val referencePrice = getMarketPrice(instId).getOrNull() ?: signal.entryPrice
+            // getMarketPrice scales its output back to signal convention —
+            // pass signal.symbol (not instId) so the scaling factor resolves
+            // correctly, then divide here for the OKX-native comparison in
+            // sanitizeTpSl (which takes OKX-native SL/TP prices).
+            val referencePriceSignal = getMarketPrice(signal.symbol).getOrNull() ?: signal.entryPrice
+            val referencePriceOkx = referencePriceSignal / scale
             val (safeTp, safeSl) = sanitizeTpSl(
                 isBuy = isBuy,
-                referencePrice = referencePrice,
-                takeProfit = signal.takeProfit,
-                stopLoss = signal.stopLoss
+                referencePrice = referencePriceOkx,
+                takeProfit = signalTp,
+                stopLoss = signalSl
             )
 
             if (signal.stopLoss != null && safeSl == null) {
                 return Result.success(OrderExecution(
                     signalId = signal.id,
                     status = ExecutionStatus.FAILED,
-                    errorMessage = "SL ${signal.stopLoss} already breached (price=$referencePrice) — order rejected"
+                    errorMessage = "SL ${signal.stopLoss} already breached (price=$referencePriceSignal) — order rejected"
                 ))
             }
 
-            // Check for multi-stage TP
-            val multiTp = extractMultiTpParams(signal.metadata, safeTp)
+            // Multi-TP — asymmetric: the extractor seeds `tp1` from the passed
+            // `safeTp` (already OKX-convention from the sanitise above), while
+            // `tp2` and `tp3` come raw from signal metadata and need scaling.
+            val rawMultiTp = extractMultiTpParams(signal.metadata, safeTp)
+            val multiTp = rawMultiTp?.copy(
+                tp2 = rawMultiTp.tp2 / scale,
+                tp3 = rawMultiTp.tp3?.let { it / scale }
+            )
 
             val orderResult = placeOrder(
                 instId = instId,
                 side = side,
                 posSide = posSide,
                 quantity = quantity,
+                // SL is intentionally NOT embedded via attachAlgoOrds anymore —
+                // see Patch 8 (2026-04-23). OKX silently dropped SL-only
+                // attachAlgoOrds (when the strategy had no TP, e.g. Impulse
+                // Breakout + trailing), so SL now always goes through a
+                // dedicated placeSlAlgoOrder call after main order succeeds.
+                // TP keeps the existing single-TP attachAlgoOrds path (which
+                // works because OCO-with-both-sides is accepted reliably).
                 takeProfit = if (multiTp != null) null else safeTp,
-                stopLoss = safeSl
+                stopLoss = null
             )
 
             if (orderResult.isSuccess) {
@@ -191,13 +245,13 @@ class OkxExchangeService(
                 val conditionalErrors = mutableListOf<String>()
                 val closeSide = if (isBuy) OkxConstants.SIDE_SELL else OkxConstants.SIDE_BUY
 
-                // Package C.2 — capture algo IDs for TP/trailing so the gateway can
-                // reconcile close events back to this execution. SL is embedded in
-                // the main order on OKX (no separate algo ID).
+                // Package C.2 / Patch 8 — capture algo IDs for TP/SL/trailing so
+                // the gateway can reconcile close events back to this execution.
                 val capturedTpOrderIds = mutableListOf<String>()
+                var capturedSlOrderId: String? = null
                 var capturedTrailingOrderId: String? = null
 
-                // Multi-stage take-profit orders
+                // Multi-stage take-profit orders (prices already scaled above)
                 if (multiTp != null) {
                     val precision = quantity.scale()
                     val tp1Qty = quantity.multiply(BigDecimal.valueOf(multiTp.tp1Pct / 100.0))
@@ -228,7 +282,23 @@ class OkxExchangeService(
                     }
                 }
 
-                // Trailing stop via algo order
+                // Stop-loss — placed as its OWN algo order (not via attachAlgoOrds).
+                // See Patch 8 (2026-04-23): OKX silently dropped SL-only
+                // attachAlgoOrds, so SL was never placed for strategies without
+                // TP (trailing-based). Now unified: both single-TP mode and
+                // multi-TP mode place SL as a separate conditional algo.
+                // Price is already scaled to OKX convention (signalSl = signal.stopLoss / scale).
+                if (safeSl != null) {
+                    val slResult = placeSlAlgoOrder(instId, closeSide, posSide, safeSl, quantity)
+                    if (slResult.isFailure) {
+                        conditionalErrors.add("SL: ${slResult.exceptionOrNull()?.message}")
+                    } else {
+                        capturedSlOrderId = slResult.getOrNull()?.takeIf { it.isNotBlank() }
+                    }
+                }
+
+                // Trailing stop — callbackRatio is a percentage (no scaling),
+                // activePx is a price (needs scaling).
                 val trailingParams = extractTrailingParams(signal.metadata)
                 if (trailingParams != null) {
                     val trailingResult = placeTrailingStopAlgoWithRecalc(
@@ -237,7 +307,7 @@ class OkxExchangeService(
                         posSide = posSide,
                         sz = quantity,
                         callbackRatio = trailingParams.deviation,
-                        activePx = trailingParams.triggerPrice,
+                        activePx = trailingParams.triggerPrice?.let { it / scale },
                         isBuy = isBuy
                     )
                     if (trailingResult.isFailure) {
@@ -255,12 +325,10 @@ class OkxExchangeService(
                 }
 
                 // Post-placement hotfix 2026-04-21: OKX POST /api/v5/trade/order
-                // returns only the ordId — no avgPx / accFillSz. Without a
-                // follow-up GET, OrderExecution.executedPrice stays null and
-                // downstream clients report `price=0.0` to the gateway (live
-                // log confirmed this on 2026-04-21). Fetch the fill details
-                // now (best-effort; don't fail the whole execution if this
-                // extra call errors).
+                // returns only the ordId — no avgPx / accFillSz. Follow up with GET.
+                // Scale the exchange-native fill back to signal convention so the
+                // OrderExecution surfaces prices/qty in the same units as the
+                // original signal (consistent with Binance/Bybit adapters).
                 val fill = fetchOrderFill(instId, orderId)
 
                 Result.success(
@@ -268,9 +336,10 @@ class OkxExchangeService(
                         signalId = signal.id,
                         status = status,
                         exchangeOrderId = orderId,
-                        executedPrice = fill?.avgPx,
-                        executedQuantity = fill?.accFillSz,
+                        executedPrice = fill?.avgPx?.times(scale),
+                        executedQuantity = fill?.accFillSz?.div(scale),
                         errorMessage = conditionalErrors.takeIf { it.isNotEmpty() }?.joinToString("; "),
+                        slOrderId = capturedSlOrderId,
                         tpOrderIds = capturedTpOrderIds.toList(),
                         trailingOrderId = capturedTrailingOrderId
                     )
@@ -309,6 +378,11 @@ class OkxExchangeService(
         // same as `pos` in getOpenPositions. Normalize to base-asset units by
         // multiplying by ctVal so downstream PnL/fee math stays correct. See
         // getOpenPositions comment for the broader context.
+        //
+        // Note: fetchOrderFill returns BASE-ASSET (post-ctVal) quantities +
+        // OKX-NATIVE prices — the caller (executeSignal) applies the 1000X
+        // signalScalingFactor once when building OrderExecution. Don't scale
+        // here to avoid double-application.
         val ctVal = getInstrumentInfo(instId)?.ctVal?.toDouble() ?: 1.0
         for ((attempt, d) in delays.withIndex()) {
             try {
@@ -364,18 +438,22 @@ class OkxExchangeService(
         return try {
             kotlinx.coroutines.delay(500L)
             val positions = getOpenPositions().getOrNull().orEmpty()
+            // Positions now come back in SIGNAL convention (scaled by
+            // getOpenPositions). Un-scale here so OrderFillInfo stays
+            // OKX-native to match the primary retry path above; the
+            // caller applies scale once.
+            val fallbackScale = scalingFactorFromInstId(instId)
             val pos = positions.firstOrNull { convertSymbol(it.symbol) == instId }
             if (pos == null || pos.size <= 0.0 || pos.entryPrice <= 0.0) {
                 logger.warn { "OKX order $orderId has no matching position — executedPrice left null" }
                 null
             } else {
-                // pos.size is ALREADY in base-asset units (getOpenPositions
-                // multiplies by ctVal there), so we pass it through as-is —
-                // do NOT multiply again.
+                val okxPrice = pos.entryPrice / fallbackScale
+                val okxQty = pos.size * fallbackScale  // base-asset, caller scales to signal
                 logger.info {
-                    "OKX order $orderId: using position snapshot avgPx=${pos.entryPrice} size=${pos.size}"
+                    "OKX order $orderId: using position snapshot avgPx=$okxPrice size=$okxQty (okx-native)"
                 }
-                OrderFillInfo(avgPx = pos.entryPrice, accFillSz = pos.size)
+                OrderFillInfo(avgPx = okxPrice, accFillSz = okxQty)
             }
         } catch (e: Exception) {
             logger.warn { "OKX order $orderId fallback position lookup failed: ${e.message}" }
@@ -497,22 +575,29 @@ class OkxExchangeService(
                     else -> "SHORT"
                 }
 
+                // 1000X scaling: for memecoins that ship as `1000XXXUSDT` in
+                // signal convention (Binance) but `XXX-USDT-SWAP` per-unit on
+                // OKX, restore the factor so prices + qty match what the rest
+                // of the system stores (ActiveTrade.entryPrice, signal.takeProfit).
+                val scale = scalingFactorFromInstId(instId)
+                val baseAssetSize = kotlin.math.abs(posSize) * ctVal
                 result.add(
                     ExchangePosition(
-                        // Denormalize OKX-native instId → universal symbol. Without
-                        // this, ActiveTrade.symbol gets overwritten by the polling
-                        // path with "BTC-USDT-SWAP" which the dashboard truncates
-                        // to "BTC-" (live regression 2026-04-21).
+                        // Denormalize OKX-native instId → universal symbol. Restores
+                        // the `1000` prefix for whitelisted memecoins so ActiveTrade.symbol
+                        // (stored as `1000SHIBUSDT`) matches the polled ExchangePosition.symbol
+                        // in MainViewModel close-detection comparisons.
                         symbol = denormalizeSymbol(instId),
                         side = side,
-                        // size in base asset units (Bug B fix — multiplied by ctVal)
-                        size = kotlin.math.abs(posSize) * ctVal,
-                        entryPrice = pos["avgPx"]?.jsonPrimitive?.content?.toDoubleOrNull() ?: 0.0,
-                        markPrice = pos["markPx"]?.jsonPrimitive?.content?.toDoubleOrNull() ?: 0.0,
+                        // signal-convention qty = base-asset / scale (1000SHIB unit = 1000 SHIB).
+                        size = baseAssetSize / scale,
+                        entryPrice = (pos["avgPx"]?.jsonPrimitive?.content?.toDoubleOrNull() ?: 0.0) * scale,
+                        markPrice = (pos["markPx"]?.jsonPrimitive?.content?.toDoubleOrNull() ?: 0.0) * scale,
+                        // unrealizedPnl + margin are USDT-denominated, not price-scaled.
                         unrealizedPnl = pos["upl"]?.jsonPrimitive?.content?.toDoubleOrNull() ?: 0.0,
                         leverage = pos["lever"]?.jsonPrimitive?.content?.toDoubleOrNull()?.toInt() ?: 1,
                         margin = pos["margin"]?.jsonPrimitive?.content?.toDoubleOrNull() ?: 0.0,
-                        liquidationPrice = pos["liqPx"]?.jsonPrimitive?.content?.toDoubleOrNull()
+                        liquidationPrice = (pos["liqPx"]?.jsonPrimitive?.content?.toDoubleOrNull())?.times(scale)
                     )
                 )
             }
@@ -544,6 +629,11 @@ class OkxExchangeService(
             // across adapters — inconsistent units there would break close
             // attribution silently.
             val ctVal = getInstrumentInfo(instId)?.ctVal?.toDouble() ?: 1.0
+            // 1000X scaling: for memecoins (`1000SHIBUSDT` in signal
+            // convention), scale OKX-native fillPx + fillSz back so the
+            // returned ExchangeFill matches the signal-convention numbers
+            // MainViewModel.resolveClose compares against.
+            val scale = signalScalingFactor(symbol)
             val params = mutableMapOf(
                 "instType" to "SWAP",
                 "instId" to instId,
@@ -564,10 +654,14 @@ class OkxExchangeService(
                 val rec = item.jsonObject
                 val ordId = rec["ordId"]?.jsonPrimitive?.content ?: return@mapNotNull null
                 val side = rec["side"]?.jsonPrimitive?.content?.uppercase() ?: return@mapNotNull null
-                val price = rec["fillPx"]?.jsonPrimitive?.content?.toDoubleOrNull() ?: return@mapNotNull null
+                val rawPrice = rec["fillPx"]?.jsonPrimitive?.content?.toDoubleOrNull() ?: return@mapNotNull null
                 val qtyContracts = rec["fillSz"]?.jsonPrimitive?.content?.toDoubleOrNull() ?: return@mapNotNull null
-                val qty = qtyContracts * ctVal
+                // base-asset qty = contracts × ctVal (OKX convention), then ÷ scale
+                // to get signal-convention qty (1000SHIB unit = 1000 SHIB).
+                val qty = (qtyContracts * ctVal) / scale
+                val price = rawPrice * scale
                 val time = rec["ts"]?.jsonPrimitive?.content?.toLongOrNull() ?: 0L
+                // fillPnl is in USDT, not price-scaled.
                 val pnl = rec["fillPnl"]?.jsonPrimitive?.content?.toDoubleOrNull()
                 // OKX execType: "T" = taker open, "M" = maker open, "C" = close.
                 // Everything other than explicit "C" is treated as "unknown" rather
@@ -855,6 +949,71 @@ class OkxExchangeService(
         return Result.success(algoId)
     }
 
+    /**
+     * Place a stop-loss as its own conditional algo order (Patch 8, 2026-04-23).
+     *
+     * Background: SL used to ride along inside `attachAlgoOrds` on the main
+     * order. In practice OKX silently dropped that embedded SL whenever no
+     * TP was paired with it (single-TP-less strategies such as Impulse
+     * Breakout that use trailing instead of a fixed TP). Main order was
+     * `sCode=0`, `attachAlgoOrdsInfo` held the actual algo-level rejection
+     * which we never parsed → UI reported PLACED while exchange had no SL.
+     *
+     * Separating the call removes the silent-drop class entirely: any
+     * algo rejection here propagates through `parseError` / `sCode` into
+     * `conditionalErrors`, and the status drops to PARTIAL so clients
+     * warn the user about an unprotected position.
+     *
+     * @param triggerPrice in OKX-native convention (caller is responsible for
+     *                     the `signal.stopLoss / scale` conversion on 1000X
+     *                     symbols).
+     */
+    private suspend fun placeSlAlgoOrder(
+        instId: String,
+        side: String,
+        posSide: String?,
+        triggerPrice: Double,
+        sz: BigDecimal
+    ): Result<String> {
+        val mgnMode = resolveMarginMode()
+        val body = buildJsonObject {
+            put("instId", JsonPrimitive(instId))
+            put("tdMode", JsonPrimitive(mgnMode))
+            put("side", JsonPrimitive(side))
+            put("ordType", JsonPrimitive("conditional"))
+            put("sz", JsonPrimitive(sz.toPlainString()))
+            put("slTriggerPx", JsonPrimitive(formatPrice(triggerPrice)))
+            put("slOrdPx", JsonPrimitive("-1")) // -1 = market close when triggered
+            put("reduceOnly", JsonPrimitive(true))
+            posSide?.let { put("posSide", JsonPrimitive(it)) }
+        }.toString()
+        logger.debug { "OKX SL algo request: $body" }
+
+        val response = httpClient.executeSignedPost(OkxConstants.Endpoints.ORDER_ALGO, body)
+            ?: return Result.failure(OkxException("No response from API"))
+        logger.debug { "OKX SL algo response: $response" }
+
+        val error = parseError(response)
+        if (error != null) {
+            logger.error { "OKX SL algo failed: ${error.message}. Response: $response" }
+            return Result.failure(error)
+        }
+
+        val obj = json.parseToJsonElement(response).jsonObject
+        val data = obj["data"]?.jsonArray ?: JsonArray(emptyList())
+        val first = data.firstOrNull()?.jsonObject
+        val sCode = first?.get("sCode")?.jsonPrimitive?.content
+        if (sCode != null && sCode != "0") {
+            val sMsg = first?.get("sMsg")?.jsonPrimitive?.content ?: "Unknown error"
+            logger.error { "OKX SL algo rejected: sCode=$sCode sMsg=$sMsg" }
+            return Result.failure(OkxApiException(sCode.toIntOrNull() ?: -1, sMsg))
+        }
+
+        val algoId = first?.get("algoId")?.jsonPrimitive?.content ?: ""
+        logger.info { "OKX SL algo placed: algoId=$algoId triggerPrice=$triggerPrice sz=$sz" }
+        return Result.success(algoId)
+    }
+
     private suspend fun placeTrailingStopAlgo(
         instId: String,
         side: String,
@@ -977,19 +1136,28 @@ class OkxExchangeService(
 
     override suspend fun getMarketPrice(symbol: String): Result<Double> {
         return try {
+            // Callers pass signal-convention (`1000SHIBUSDT` or `BTCUSDT`) —
+            // convert to OKX instId before the request. This fixes a
+            // pre-existing latent bug where getMarketPrice failed silently on
+            // OKX for every call with non-OKX-format symbol (returning null
+            // and forcing fallbacks to signal.entryPrice in MainViewModel).
+            val instId = convertSymbol(symbol)
+            val scale = signalScalingFactor(symbol)
             val response = httpClient.executePublicGet(
                 OkxConstants.Endpoints.MARKET_TICKER,
-                mapOf("instId" to symbol)
+                mapOf("instId" to instId)
             ) ?: return Result.failure(OkxException("No response from API"))
 
             val obj = json.parseToJsonElement(response).jsonObject
             val data = obj["data"]?.jsonArray ?: JsonArray(emptyList())
             val first = data.firstOrNull()?.jsonObject
                 ?: return Result.failure(OkxException("Empty ticker data"))
-            val price = first["last"]?.jsonPrimitive?.content?.toDoubleOrNull()
+            val exchangePrice = first["last"]?.jsonPrimitive?.content?.toDoubleOrNull()
                 ?: first["markPx"]?.jsonPrimitive?.content?.toDoubleOrNull()
                 ?: return Result.failure(OkxException("Cannot parse price"))
-            Result.success(price)
+            // Scale OKX-native price back to signal convention so the caller
+            // sees the same number units as `signal.entryPrice`.
+            Result.success(exchangePrice * scale)
         } catch (e: Exception) {
             Result.failure(e)
         }
@@ -1167,15 +1335,22 @@ class OkxExchangeService(
      * 2026-04-21 live regression where OKX positions displayed as "BTC-"
      * (truncated OKX-native format) instead of "BTCUSDT" on the dashboard.
      *
-     * Lossy edge: OKX doesn't use the "1000" multiplier prefix, so
-     * `PEPE-USDT-SWAP` maps to `PEPEUSDT` even when the signal was
-     * `1000PEPEUSDT`. Callers that need exact round-trip should preserve
-     * the original signal symbol rather than relying on this method.
+     * For memecoins that Binance lists with a 1000x multiplier prefix
+     * (`1000SHIBUSDT`) but OKX lists per-unit (`SHIB-USDT-SWAP`), the prefix
+     * is RESTORED from [OKX_SCALED_1000X_BASES] so [ExchangePosition.symbol]
+     * matches the [ActiveTrade.symbol] stored from the original signal.
+     * Without this, poll-based close matching in MainViewModel compared
+     * `1000SHIBUSDT` (ActiveTrade) vs `SHIBUSDT` (polled position) → mismatch
+     * → false-positive orphan detection.
      */
     internal fun denormalizeSymbol(instId: String): String {
         if (!instId.contains("-")) return instId
         val parts = instId.removeSuffix("-SWAP").split("-")
-        return if (parts.size >= 2) parts.joinToString("") else instId
+        if (parts.size < 2) return instId
+        val base = parts[0].uppercase()
+        val quote = parts[1]
+        val prefix = if (base in OKX_SCALED_1000X_BASES) "1000" else ""
+        return "$prefix$base$quote"
     }
 
     internal fun convertSymbol(symbol: String): String {
@@ -1199,6 +1374,42 @@ class OkxExchangeService(
         } else {
             cleaned
         }
+    }
+
+    /**
+     * Returns the multiplier between signal-convention prices and OKX-native
+     * prices for [signalSymbol]. `1000SHIBUSDT` → 1000.0, `BTCUSDT` → 1.0.
+     *
+     * Rule: every price flowing into the OKX API is `signalPrice / factor`,
+     * every price flowing out is `exchangePrice * factor`. Quantities flow
+     * the opposite way (signal→exchange multiplies by factor, exchange→signal
+     * divides). Applied at the adapter boundary so the rest of the system
+     * can treat signal-convention prices/qty uniformly across all 4 exchanges.
+     */
+    internal fun signalScalingFactor(signalSymbol: String): Double {
+        val cleaned = signalSymbol.uppercase().replace("_", "-").replace("-", "")
+        val quote = listOf("USDT", "USDC", "BUSD").find { cleaned.endsWith(it) } ?: return 1.0
+        val base = cleaned.removeSuffix(quote)
+        return when {
+            // Narrow allow-list of known Binance-futures prefix patterns to
+            // avoid false-positives on numeric-prefix tickers like 1INCHUSDT.
+            base.startsWith("10000") -> 10_000.0
+            base.startsWith("1000") -> 1000.0
+            base.startsWith("1M") -> 1_000_000.0
+            else -> 1.0
+        }
+    }
+
+    /**
+     * Factor derived from an OKX instId when the caller doesn't have the
+     * original signal symbol (e.g. `getOpenPositions` iterates all positions
+     * without per-call context). Uses the [OKX_SCALED_1000X_BASES] whitelist
+     * — kept narrow so non-memecoin tokens that happen to share 3-4 letter
+     * bases aren't accidentally scaled.
+     */
+    private fun scalingFactorFromInstId(instId: String): Double {
+        val base = instId.substringBefore("-").uppercase()
+        return if (base in OKX_SCALED_1000X_BASES) 1000.0 else 1.0
     }
 
     private fun parseError(response: String): OkxApiException? {

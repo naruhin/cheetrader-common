@@ -40,6 +40,23 @@ class BingXExchangeService(
     baseUrlOverride: String? = null
 ) : ExchangeService {
 
+    companion object {
+        /**
+         * Base symbols for tokens that Binance futures lists with a `1000X`
+         * multiplier prefix (`1000SHIBUSDT`) but BingX lists per-unit
+         * (`SHIB-USDT`). The adapter applies a 1000× conversion at its
+         * boundary for these — same pattern as OKX. Previously (pre-2026-04-23)
+         * BingX silently built `1000SHIB-USDT` instrument which doesn't
+         * exist on BingX → order rejection, dead trade.
+         *
+         * Keep aligned with [com.cheetrader.common.exchange.okx.OkxExchangeService.OKX_SCALED_1000X_BASES].
+         */
+        internal val BINGX_SCALED_1000X_BASES = setOf(
+            "SHIB", "PEPE", "BONK", "FLOKI", "LUNC", "SATS",
+            "RATS", "CAT", "CHEEMS", "XEC", "X", "TOSHI"
+        )
+    }
+
     override val name = "BingX"
 
     private val baseUrl = baseUrlOverride ?: if (testnet) {
@@ -104,6 +121,15 @@ class BingXExchangeService(
             val balance = balanceResult.getOrThrow()
 
             val symbol = convertSymbol(signal.symbol)
+            // 1000X catastrophe fix (2026-04-23): Binance-convention signal
+            // prices (`1000SHIBUSDT @ 0.006`) must be divided by 1000 when
+            // placed on BingX, which trades the underlying at `0.000006` per
+            // SHIB. Factor = 1.0 for non-scaled symbols so no-op for BTC/ETH.
+            val scale = signalScalingFactor(signal.symbol)
+            val signalEntry = signal.entryPrice / scale
+            val signalSl = signal.stopLoss?.let { it / scale }
+            val signalTp = signal.takeProfit?.let { it / scale }
+
             val isBuy = signal.type == SignalType.LONG
             val side = if (isBuy) BingXConstants.SIDE_BUY else BingXConstants.SIDE_SELL
             val positionSide = if (isBuy) BingXConstants.POSITION_SIDE_LONG else BingXConstants.POSITION_SIDE_SHORT
@@ -111,27 +137,39 @@ class BingXExchangeService(
             setupPosition(symbol, positionSide)
 
             val tradeAmount = balance * (balancePercent / 100.0) * defaultLeverage
-            val quantity = calculateQuantity(tradeAmount, signal.entryPrice, symbol)
+            // Pass BingX-side price so quantity = notional / bingxPrice yields
+            // ~1000× more base-asset units for a 1000X symbol — matches intended
+            // notional on a per-unit exchange.
+            val quantity = calculateQuantity(tradeAmount, signalEntry, symbol)
 
-            // Sanitize TP/SL
-            val referencePrice = getMarketPrice(symbol).getOrNull() ?: signal.entryPrice
+            // Sanitize TP/SL — reference price fetched via getMarketPrice, which
+            // scales output back to signal convention. Divide by scale to keep
+            // comparison in BingX-native space (same space as safeTp/safeSl).
+            val referencePriceSignal = getMarketPrice(signal.symbol).getOrNull() ?: signal.entryPrice
+            val referencePriceBingX = referencePriceSignal / scale
             val (safeTp, safeSl) = sanitizeTpSl(
                 isBuy = isBuy,
-                referencePrice = referencePrice,
-                takeProfit = signal.takeProfit,
-                stopLoss = signal.stopLoss
+                referencePrice = referencePriceBingX,
+                takeProfit = signalTp,
+                stopLoss = signalSl
             )
 
             if (signal.stopLoss != null && safeSl == null) {
                 return Result.success(OrderExecution(
                     signalId = signal.id,
                     status = ExecutionStatus.FAILED,
-                    errorMessage = "SL ${signal.stopLoss} already breached (price=$referencePrice) — order rejected"
+                    errorMessage = "SL ${signal.stopLoss} already breached (price=$referencePriceSignal) — order rejected"
                 ))
             }
 
-            // Check for multi-stage TP
-            val multiTp = extractMultiTpParams(signal.metadata, safeTp)
+            // Multi-TP — asymmetric: extractor seeds `tp1` from the passed
+            // `safeTp` (already BingX-convention), while `tp2` and `tp3`
+            // come raw from signal metadata and need explicit scaling.
+            val rawMultiTp = extractMultiTpParams(signal.metadata, safeTp)
+            val multiTp = rawMultiTp?.copy(
+                tp2 = rawMultiTp.tp2 / scale,
+                tp3 = rawMultiTp.tp3?.let { it / scale }
+            )
 
             val order = if (multiTp != null) {
                 // Multi-TP: don't embed TP in main order, place separately after
@@ -248,8 +286,8 @@ class BingXExchangeService(
                         side = trailingSide,
                         positionSide = positionSide,
                         quantity = quantity,
-                        priceRate = trailingParams.deviation, // decimal: 0.01 = 1%
-                        activationPrice = trailingParams.triggerPrice,
+                        priceRate = trailingParams.deviation, // decimal: 0.01 = 1% (no scaling, it's a ratio)
+                        activationPrice = trailingParams.triggerPrice?.let { it / scale },
                         isBuy = isBuy
                     )
                     if (trailingResult.isFailure) {
@@ -291,8 +329,11 @@ class BingXExchangeService(
                     // Filter out BingX's "0" placeholder avgPrice/qty — these arrive when
                     // a market order hasn't settled its fill price yet. Surfacing 0.0 as
                     // "executed price" breaks PnL and dashboard math downstream.
-                    executedPrice = orderData.price?.toDoubleOrNull()?.takeIf { it > 0.0 },
-                    executedQuantity = orderData.quantity?.toDoubleOrNull()?.takeIf { it > 0.0 },
+                    //
+                    // Scale BingX-native price back to signal convention; scale qty the
+                    // opposite way so downstream sees numbers in `1000SHIBUSDT` space.
+                    executedPrice = orderData.price?.toDoubleOrNull()?.takeIf { it > 0.0 }?.times(scale),
+                    executedQuantity = orderData.quantity?.toDoubleOrNull()?.takeIf { it > 0.0 }?.div(scale),
                     errorMessage = conditionalErrors.takeIf { it.isNotEmpty() }?.joinToString("; "),
                     hasExchangeStopLoss = hasStopLoss,
                     hasExchangeTakeProfit = hasTakeProfit,
@@ -429,17 +470,24 @@ class BingXExchangeService(
                     val side = posObj["positionSide"]?.jsonPrimitive?.content
                         ?: if (positionAmt > 0) "LONG" else "SHORT"
 
+                    // Restore signal convention:
+                    //  - symbol: `SHIB-USDT` → `1000SHIBUSDT` (match ActiveTrade)
+                    //  - price/qty: 1000× factor for whitelisted memecoins
+                    //  - PnL/margin: USDT-denominated, NOT price-scaled
+                    val bingxSymbol = posObj["symbol"]?.jsonPrimitive?.content ?: return@mapNotNull null
+                    val universalSymbol = denormalizeSymbol(bingxSymbol)
+                    val scale = signalScalingFactor(universalSymbol)
                     ExchangePosition(
-                        symbol = posObj["symbol"]?.jsonPrimitive?.content ?: return@mapNotNull null,
+                        symbol = universalSymbol,
                         side = side,
-                        size = kotlin.math.abs(positionAmt),
-                        entryPrice = posObj["avgPrice"]?.jsonPrimitive?.content?.toDoubleOrNull() ?: 0.0,
-                        markPrice = posObj["markPrice"]?.jsonPrimitive?.content?.toDoubleOrNull() ?: 0.0,
+                        size = kotlin.math.abs(positionAmt) / scale,
+                        entryPrice = (posObj["avgPrice"]?.jsonPrimitive?.content?.toDoubleOrNull() ?: 0.0) * scale,
+                        markPrice = (posObj["markPrice"]?.jsonPrimitive?.content?.toDoubleOrNull() ?: 0.0) * scale,
                         unrealizedPnl = posObj["unrealizedProfit"]?.jsonPrimitive?.content?.toDoubleOrNull() ?: 0.0,
                         leverage = posObj["leverage"]?.jsonPrimitive?.content?.toIntOrNull() ?: 1,
                         margin = posObj["initialMargin"]?.jsonPrimitive?.content?.toDoubleOrNull()
                             ?: posObj["margin"]?.jsonPrimitive?.content?.toDoubleOrNull() ?: 0.0,
-                        liquidationPrice = posObj["liquidationPrice"]?.jsonPrimitive?.content?.toDoubleOrNull()
+                        liquidationPrice = posObj["liquidationPrice"]?.jsonPrimitive?.content?.toDoubleOrNull()?.times(scale)
                     )
                 }
                 Result.success(result)
@@ -467,6 +515,10 @@ class BingXExchangeService(
     ): Result<List<ExchangeFill>> {
         return try {
             val bingxSymbol = convertSymbol(symbol)
+            // 1000X scaling: for memecoins (`1000SHIBUSDT` signal convention)
+            // scale BingX-native fill price/qty back so MainViewModel's
+            // resolveClose compares against consistent numbers.
+            val scale = signalScalingFactor(symbol)
             val params = mutableMapOf(
                 "symbol" to bingxSymbol,
                 "startTs" to sinceMs.coerceAtLeast(0L).toString(),
@@ -493,20 +545,21 @@ class BingXExchangeService(
                 val rec = item.jsonObject
                 val orderId = rec["orderId"]?.jsonPrimitive?.content ?: return@mapNotNull null
                 val side = rec["side"]?.jsonPrimitive?.content?.uppercase() ?: return@mapNotNull null
-                val price = rec["price"]?.jsonPrimitive?.content?.toDoubleOrNull() ?: return@mapNotNull null
-                val qty = rec["volume"]?.jsonPrimitive?.content?.toDoubleOrNull()
+                val rawPrice = rec["price"]?.jsonPrimitive?.content?.toDoubleOrNull() ?: return@mapNotNull null
+                val rawQty = rec["volume"]?.jsonPrimitive?.content?.toDoubleOrNull()
                     ?: rec["qty"]?.jsonPrimitive?.content?.toDoubleOrNull()
                     ?: return@mapNotNull null
                 val time = rec["filledTm"]?.jsonPrimitive?.content?.toLongOrNull()
                     ?: rec["tradingTime"]?.jsonPrimitive?.content?.toLongOrNull()
                     ?: 0L
+                // realisedPNL is USDT-denominated, not price-scaled.
                 val pnl = rec["realisedPNL"]?.jsonPrimitive?.content?.toDoubleOrNull()
                     ?: rec["profit"]?.jsonPrimitive?.content?.toDoubleOrNull()
                 ExchangeFill(
                     orderId = orderId,
                     side = side,
-                    price = price,
-                    quantity = qty,
+                    price = rawPrice * scale,
+                    quantity = rawQty / scale,
                     time = time,
                     realizedPnl = pnl,
                     isReduceOnly = null
@@ -529,13 +582,19 @@ class BingXExchangeService(
      * not exist on-exchange. We retry twice with a 1s gap to tolerate settlement delay.
      */
     private suspend fun verifyPositionOpened(symbol: String, positionSide: String): Boolean {
+        // `symbol` arrives as BingX-native (`SHIB-USDT`), while getOpenPositions
+        // now returns signal-convention (`1000SHIBUSDT`). Normalize both sides
+        // to a canonical form before comparing.
+        val expectedUniversal = denormalizeSymbol(symbol)
         val maxAttempts = 2
         repeat(maxAttempts) {
             delay(1000)
             val positions = getOpenPositions().getOrNull()
             if (positions != null) {
                 val match = positions.any { pos ->
-                    pos.symbol == symbol && pos.side.equals(positionSide, ignoreCase = true) && pos.size > 0.0
+                    pos.symbol.equals(expectedUniversal, ignoreCase = true) &&
+                        pos.side.equals(positionSide, ignoreCase = true) &&
+                        pos.size > 0.0
                 }
                 if (match) return true
             }
@@ -788,17 +847,27 @@ class BingXExchangeService(
 
     override suspend fun getMarketPrice(symbol: String): Result<Double> {
         return try {
+            // Callers pass either signal-convention (`1000SHIBUSDT`, `BTCUSDT`)
+            // or already-converted BingX format (`BTC-USDT`). Normalize so the
+            // request always uses BingX's expected format, fixing a pre-existing
+            // latent bug where calls with `BTCUSDT` (no dash) were rejected by
+            // BingX silently.
+            val bingxSymbol = convertSymbol(symbol)
+            val scale = signalScalingFactor(symbol)
             val response = httpClient.executeSignedGet(
                 "/openApi/swap/v2/quote/price",
-                mutableMapOf("symbol" to symbol)
+                mutableMapOf("symbol" to bingxSymbol)
             ) ?: return Result.failure(BingXException("No response from API"))
 
             val jsonResponse = json.parseToJsonElement(response).jsonObject
             val code = jsonResponse["code"]?.jsonPrimitive?.intOrNull
             if (code == BingXConstants.ErrorCodes.SUCCESS) {
-                val price = jsonResponse["data"]?.jsonObject?.get("price")?.jsonPrimitive?.content?.toDoubleOrNull()
+                val exchangePrice = jsonResponse["data"]?.jsonObject?.get("price")?.jsonPrimitive?.content?.toDoubleOrNull()
                     ?: return Result.failure(BingXException("Cannot parse price"))
-                Result.success(price)
+                // Scale BingX-native price back to signal convention (no-op
+                // when caller already used BingX format since scale then = 1.0
+                // via the whitelist; memecoin SHIB-USDT → 1000.0 matches).
+                Result.success(exchangePrice * scale)
             } else {
                 val msg = jsonResponse["msg"]?.jsonPrimitive?.content ?: "Unknown error"
                 Result.failure(BingXApiException(code ?: -1, msg))
@@ -836,11 +905,71 @@ class BingXExchangeService(
 
         val quote = listOf("USDT", "USDC", "BUSD").find { symbol.endsWith(it) }
         return if (quote != null) {
-            val base = symbol.removeSuffix(quote)
+            var base = symbol.removeSuffix(quote)
+            // BingX lists memecoins per-unit (`SHIB-USDT`), not with the
+            // `1000X` multiplier prefix Binance uses. Strip so signals
+            // for `1000SHIBUSDT` land on the valid BingX instrument.
+            // Paired with `signalScalingFactor` which converts prices/qty.
+            base = stripScalingPrefix(base)
             "$base-$quote"
         } else {
             symbol
         }
+    }
+
+    /**
+     * Returns the 1000× multiplier between signal-convention prices and
+     * BingX-native prices for [symbol]. Handles both signal format
+     * (`1000SHIBUSDT` → 1000.0) and BingX-native format with whitelist
+     * fallback (`SHIB-USDT` → 1000.0 when SHIB is a known scaled base).
+     *
+     * Rule: every price flowing to the BingX API is `signalPrice / factor`;
+     * every price flowing back out is `exchangePrice * factor`. Quantities
+     * flow the opposite way. Applied at the adapter boundary so the rest
+     * of the system treats signal-convention values uniformly.
+     */
+    internal fun signalScalingFactor(symbol: String): Double {
+        val cleaned = symbol.uppercase().replace("_", "-").replace("-", "")
+        val quote = listOf("USDT", "USDC", "BUSD").find { cleaned.endsWith(it) } ?: return 1.0
+        var base = cleaned.removeSuffix(quote)
+        // Prefix-based parse first (signal format)
+        val byPrefix = when {
+            base.startsWith("10000") -> 10_000.0.also { base = base.removePrefix("10000") }
+            base.startsWith("1000") -> 1000.0.also { base = base.removePrefix("1000") }
+            base.startsWith("1M") -> 1_000_000.0.also { base = base.removePrefix("1M") }
+            else -> null
+        }
+        if (byPrefix != null) return byPrefix
+        // No prefix — fall back to whitelist (handles BingX-format input)
+        return if (base in BINGX_SCALED_1000X_BASES) 1000.0 else 1.0
+    }
+
+    /**
+     * Strips known multiplier prefix from a base symbol. `1000SHIB` → `SHIB`,
+     * `10000ELON` → `ELON`, `SHIB` → `SHIB`. Used inside [convertSymbol] to
+     * build the correct BingX instrument name.
+     */
+    private fun stripScalingPrefix(base: String): String = when {
+        base.startsWith("10000") -> base.removePrefix("10000")
+        base.startsWith("1000") -> base.removePrefix("1000")
+        base.startsWith("1M") -> base.removePrefix("1M")
+        else -> base
+    }
+
+    /**
+     * Converts BingX-native `SHIB-USDT` back to universal signal convention
+     * `1000SHIBUSDT` (restoring the `1000` prefix for whitelisted memecoins).
+     * Used in [getOpenPositions] so the polled [ExchangePosition.symbol]
+     * matches [ActiveTrade.symbol] stored from the original signal.
+     */
+    internal fun denormalizeSymbol(bingxSymbol: String): String {
+        if (!bingxSymbol.contains("-")) return bingxSymbol
+        val parts = bingxSymbol.split("-")
+        if (parts.size < 2) return bingxSymbol
+        val base = parts[0].uppercase()
+        val quote = parts[1]
+        val prefix = if (base in BINGX_SCALED_1000X_BASES) "1000" else ""
+        return "$prefix$base$quote"
     }
 
     internal fun calculateQuantity(amountUsdt: Double, price: Double, symbol: String): BigDecimal {

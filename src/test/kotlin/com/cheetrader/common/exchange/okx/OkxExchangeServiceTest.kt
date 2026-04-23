@@ -99,16 +99,19 @@ class OkxExchangeServiceTest {
         mock.enqueue(OkxResponses.instrument("BTC-USDT-SWAP", "0.01", "1", "1"))
         // getMarketPrice
         mock.enqueue(OkxResponses.ticker(65000.0))
-        // getAccountConfig (cached from above, might not fire)
-        // resolveMarginMode -> getAccountConfig (cached)
         // placeOrder
         mock.enqueue(OkxResponses.orderSuccess("okx-order-1"))
+        // Patch 8 (2026-04-23) — SL is now a separate algo order, not embedded
+        // in the main order's `attachAlgoOrds`. Tests with an SL must enqueue a
+        // `placeSlAlgoOrder` response immediately after the main `orderSuccess`.
+        mock.enqueue(OkxResponses.algoSuccess("okx-sl-1"))
 
         val result = service.executeSignal(signal, 5.0)
         assertTrue(result.isSuccess)
         val exec = result.getOrThrow()
         assertEquals(ExecutionStatus.SUCCESS, exec.status)
         assertEquals("okx-order-1", exec.exchangeOrderId)
+        assertEquals("okx-sl-1", exec.slOrderId, "SL algo order ID must be captured")
     }
 
     @Test
@@ -175,6 +178,8 @@ class OkxExchangeServiceTest {
         mock.enqueue(OkxResponses.instrument("BTC-USDT-SWAP", "0.01", "1", "1"))
         mock.enqueue(OkxResponses.ticker(65000.0))
         mock.enqueue(OkxResponses.orderSuccess())
+        // Patch 8 — SL is placed as a separate algo order before trailing.
+        mock.enqueue(OkxResponses.algoSuccess("sl-123"))
         mock.enqueue(OkxResponses.algoSuccess("trailing-123"))
 
         val result = service.executeSignal(signal, 5.0)
@@ -236,6 +241,8 @@ class OkxExchangeServiceTest {
         mock.enqueue(OkxResponses.instrument("BTC-USDT-SWAP", "0.01", "1", "1"))
         mock.enqueue(OkxResponses.ticker(65000.0))
         mock.enqueue(OkxResponses.orderSuccess("okx-order-fill-slow"))
+        // Patch 8 — SL placed as separate algo before fetchOrderFill retries.
+        mock.enqueue(OkxResponses.algoSuccess("okx-sl-fill-slow"))
         // fetchOrderFill 3 retries — OKX's "not yet filled" sentinel (empty
         // avgPx/accFillSz strings, code=0).
         val notFilled = """{"code":"0","msg":"","data":[{"ordId":"okx-order-fill-slow","avgPx":"","accFillSz":""}]}"""
@@ -273,6 +280,8 @@ class OkxExchangeServiceTest {
         mock.enqueue(OkxResponses.instrument("BTC-USDT-SWAP", "0.01", "1", "1"))
         mock.enqueue(OkxResponses.ticker(65000.0))
         mock.enqueue(OkxResponses.orderSuccess("okx-order-ghost"))
+        // Patch 8 — SL placed as separate algo before fetchOrderFill retries.
+        mock.enqueue(OkxResponses.algoSuccess("okx-sl-ghost"))
         val notFilled = """{"code":"0","msg":"","data":[{"ordId":"okx-order-ghost","avgPx":"","accFillSz":""}]}"""
         mock.enqueue(notFilled)
         mock.enqueue(notFilled)
@@ -289,6 +298,65 @@ class OkxExchangeServiceTest {
         assertEquals("okx-order-ghost", exec.exchangeOrderId)
         assertEquals(null, exec.executedPrice)
         assertEquals(null, exec.executedQuantity)
+    }
+
+    @Test
+    fun `executeSignal SL-only no TP places SL via separate algo order`() = runTest {
+        // Patch 8 (2026-04-23) regression guard: strategies without TP (trailing-
+        // based like Impulse Breakout) previously embedded SL in `attachAlgoOrds`.
+        // OKX silently dropped SL-only attach — main order succeeded, no SL on
+        // the exchange, `attachAlgoOrdsInfo` carried the rejection which we
+        // never parsed. Now SL always goes through its own `placeSlAlgoOrder`
+        // call after main order success — rejections surface as PARTIAL status
+        // via `conditionalErrors`.
+        val signal = TestSignals.longBtc(tp = null, sl = 60000.0)
+
+        mock.enqueue(OkxResponses.balance(1000.0))
+        mock.enqueue(OkxResponses.accountConfig("long_short_mode", 2))
+        mock.enqueue(OkxResponses.leverageSuccess())
+        mock.enqueue(OkxResponses.leverageSuccess())
+        mock.enqueue(OkxResponses.instrument("BTC-USDT-SWAP", "0.01", "1", "1"))
+        mock.enqueue(OkxResponses.ticker(65000.0))
+        mock.enqueue(OkxResponses.orderSuccess("okx-sl-only-order"))
+        mock.enqueue(OkxResponses.algoSuccess("sl-only-algo"))
+
+        val result = service.executeSignal(signal, 5.0)
+        assertTrue(result.isSuccess)
+        val exec = result.getOrThrow()
+        assertEquals(ExecutionStatus.SUCCESS, exec.status)
+        assertEquals("okx-sl-only-order", exec.exchangeOrderId)
+        assertEquals("sl-only-algo", exec.slOrderId)
+    }
+
+    @Test
+    fun `executeSignal SL placement failure yields PARTIAL status`() = runTest {
+        // Patch 8 — if the separate SL algo is rejected by OKX, the main order
+        // still succeeded and the position is live. Status must drop to PARTIAL
+        // so the ViewModel warns the user about the unprotected position
+        // (`hasExchangeStopLoss` flag downstream).
+        val signal = TestSignals.longBtc(tp = null, sl = 60000.0)
+
+        mock.enqueue(OkxResponses.balance(1000.0))
+        mock.enqueue(OkxResponses.accountConfig("long_short_mode", 2))
+        mock.enqueue(OkxResponses.leverageSuccess())
+        mock.enqueue(OkxResponses.leverageSuccess())
+        mock.enqueue(OkxResponses.instrument("BTC-USDT-SWAP", "0.01", "1", "1"))
+        mock.enqueue(OkxResponses.ticker(65000.0))
+        mock.enqueue(OkxResponses.orderSuccess("okx-sl-fail-order"))
+        // SL algo rejected — any code != "0" in first data element.
+        mock.enqueue(OkxResponses.apiError(51002, "Invalid SL trigger price"))
+
+        val result = service.executeSignal(signal, 5.0)
+        assertTrue(result.isSuccess)
+        val exec = result.getOrThrow()
+        assertEquals(ExecutionStatus.PARTIAL, exec.status, "SL rejection must degrade to PARTIAL")
+        assertEquals("okx-sl-fail-order", exec.exchangeOrderId)
+        assertEquals(null, exec.slOrderId, "failed SL must not capture an ID")
+        assertNotNull(exec.errorMessage)
+        assertTrue(
+            exec.errorMessage!!.contains("SL"),
+            "errorMessage should identify the failing conditional: ${exec.errorMessage}"
+        )
     }
 
     // ===== getOpenPositionsCount =====

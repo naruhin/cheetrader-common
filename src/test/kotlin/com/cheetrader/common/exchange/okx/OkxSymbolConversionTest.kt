@@ -31,8 +31,16 @@ class OkxSymbolConversionTest {
     @Test fun `denormalize already flat`() = assertEquals("BTCUSDT", service.denormalizeSymbol("BTCUSDT"))
     @Test fun `denormalize without SWAP suffix`() = assertEquals("BTCUSDT", service.denormalizeSymbol("BTC-USDT"))
     @Test fun `denormalize USDC quote`() = assertEquals("ETHUSDC", service.denormalizeSymbol("ETH-USDC-SWAP"))
-    // Lossy edge: OKX doesn't carry the 1000-prefix convention, so this is expected.
-    @Test fun `denormalize memecoin returns base without 1000 prefix`() = assertEquals("PEPEUSDT", service.denormalizeSymbol("PEPE-USDT-SWAP"))
+    // Since 2026-04-23, denormalizeSymbol RESTORES the `1000` prefix for
+    // memecoins in the OKX_SCALED_1000X_BASES whitelist so ExchangePosition.symbol
+    // matches the signal-convention ActiveTrade.symbol — required for close-detection
+    // in MainViewModel (previously mismatched and broke 1000X trades silently).
+    @Test fun `denormalize memecoin restores 1000 prefix for PEPE`() =
+        assertEquals("1000PEPEUSDT", service.denormalizeSymbol("PEPE-USDT-SWAP"))
+    @Test fun `denormalize memecoin restores 1000 prefix for SHIB`() =
+        assertEquals("1000SHIBUSDT", service.denormalizeSymbol("SHIB-USDT-SWAP"))
+    @Test fun `denormalize memecoin restores 1000 prefix for BONK`() =
+        assertEquals("1000BONKUSDT", service.denormalizeSymbol("BONK-USDT-SWAP"))
 
     @Test fun `sanitizeTpSl valid long`() {
         val (tp, sl) = service.sanitizeTpSl(true, 65000.0, 70000.0, 60000.0)
@@ -45,4 +53,25 @@ class OkxSymbolConversionTest {
         assertNull(tp, "TP above entry invalid for SHORT")
         assertNull(sl, "SL below entry invalid for SHORT")
     }
+
+    // ─── 1000X scaling factor (2026-04-23 fix) ─────────────────────────────
+
+    @Test fun `signalScalingFactor 1000SHIBUSDT is 1000`() =
+        assertEquals(1000.0, service.signalScalingFactor("1000SHIBUSDT"))
+    @Test fun `signalScalingFactor 1000PEPEUSDT is 1000`() =
+        assertEquals(1000.0, service.signalScalingFactor("1000PEPEUSDT"))
+    @Test fun `signalScalingFactor 10000ELONUSDT is 10000`() =
+        assertEquals(10_000.0, service.signalScalingFactor("10000ELONUSDT"))
+    @Test fun `signalScalingFactor 1MBABYDOGEUSDT is 1M`() =
+        assertEquals(1_000_000.0, service.signalScalingFactor("1MBABYDOGEUSDT"))
+    @Test fun `signalScalingFactor BTCUSDT is 1`() =
+        assertEquals(1.0, service.signalScalingFactor("BTCUSDT"))
+    @Test fun `signalScalingFactor ETHUSDT is 1`() =
+        assertEquals(1.0, service.signalScalingFactor("ETHUSDT"))
+    // Numeric-prefix ticker 1INCH must NOT be scaled (starts with "1" not "1000").
+    @Test fun `signalScalingFactor 1INCHUSDT is 1 (no scale)`() =
+        assertEquals(1.0, service.signalScalingFactor("1INCHUSDT"))
+    // Lowercase input
+    @Test fun `signalScalingFactor is case insensitive`() =
+        assertEquals(1000.0, service.signalScalingFactor("1000shibusdt"))
 }
