@@ -93,6 +93,30 @@ interface ExchangeService {
         sinceMs: Long,
         limit: Int = 50
     ): Result<List<ExchangeFill>> = Result.success(emptyList())
+
+    /**
+     * Fetch the exchange's authoritative realized PnL for the most recently
+     * closed position of [symbol]. Mirrors what the exchange UI shows in its
+     * positions-history view — the final, fee-and-funding-inclusive number.
+     *
+     * Use this in preference to recomputing PnL from fills when reconciling
+     * a just-closed position. Per-fill `realizedPnl` (e.g. OKX `fillPnl`,
+     * Binance `realizedPnl`) is GROSS on most exchanges — summing it without
+     * subtracting fees produces an inflated number that diverges from the UI.
+     *
+     * Default returns null. Adapters override where the endpoint exists:
+     *   - OKX `/api/v5/account/positions-history`  ✓
+     *   - Binance — TODO (income endpoint or position adjustment delta)
+     *   - BingX — TODO
+     *   - Bybit — TODO (closed-pnl endpoint)
+     *
+     * @param symbol canonical symbol (adapter normalises per exchange)
+     * @param withinMs only return records closed within this window from now
+     */
+    suspend fun getMostRecentClosedPositionPnl(
+        symbol: String,
+        withinMs: Long = 300_000L
+    ): Result<AuthoritativeClosedPnl?> = Result.success(null)
 }
 
 /**
@@ -135,6 +159,32 @@ data class ExchangePosition(
     val leverage: Int,
     val margin: Double,             // initial margin (USDT)
     val liquidationPrice: Double?
+)
+
+/**
+ * Authoritative realized PnL for a recently-closed position, sourced from
+ * the exchange's own position-history record. The reported number is what
+ * the exchange itself recorded — fees, funding, and any other adjustments
+ * already folded in — so it matches the value shown in the exchange UI.
+ *
+ * Returned by [ExchangeService.getMostRecentClosedPositionPnl]. Prefer this
+ * over recomputing from per-fill PnL when reconciling a manual or auto
+ * close, since per-fill PnL is gross on most exchanges and produces an
+ * inflated total.
+ *
+ * @property realizedPnl Net realized PnL in USDT — exchange's final figure.
+ * @property pnlRatio PnL as ratio (e.g. 0.0674 = 6.74%). Null if not exposed.
+ * @property grossPnl Gross PnL before fees, when separately reported.
+ * @property fees Total fees signed (negative for outflow). Null if unknown.
+ * @property closedAt Unix millis when the position record closed.
+ */
+data class AuthoritativeClosedPnl(
+    val symbol: String,
+    val realizedPnl: Double,
+    val pnlRatio: Double? = null,
+    val grossPnl: Double? = null,
+    val fees: Double? = null,
+    val closedAt: Long
 )
 
 /**

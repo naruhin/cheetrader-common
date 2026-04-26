@@ -1,5 +1,6 @@
 package com.cheetrader.common.exchange.okx
 
+import com.cheetrader.common.exchange.AuthoritativeClosedPnl
 import com.cheetrader.common.exchange.ExchangeFill
 import com.cheetrader.common.exchange.ExchangePosition
 import com.cheetrader.common.exchange.ExchangeService
@@ -15,6 +16,7 @@ import com.cheetrader.common.model.Signal
 import com.cheetrader.common.model.SignalType
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
@@ -681,6 +683,83 @@ class OkxExchangeService(
             Result.success(fills)
         } catch (e: Exception) {
             logger.error(e) { "OKX get recent fills failed" }
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * Authoritative post-close PnL via `/api/v5/account/positions-history`.
+     *
+     * OKX exposes a richer set of fields than per-fill `fillPnl`:
+     *   - `pnl`         — gross (price-difference × size)
+     *   - `fee`         — total trading fees (signed; negative for outflow)
+     *   - `fundingFee`  — accumulated funding while position was open
+     *   - `realizedPnl` — `pnl + fee + fundingFee + liqPenalty` (NET — matches UI)
+     *   - `pnlRatio`    — net PnL ratio (matches UI's PnL% column)
+     *
+     * Resolving from this endpoint avoids the recurring "fills-summed gross
+     * vs UI-shown net" divergence that produces ~2-3% inflated dashboard
+     * PnL after manual / SL / TP closes.
+     *
+     * Returns null if no record matches [symbol] within [withinMs] from now.
+     */
+    override suspend fun getMostRecentClosedPositionPnl(
+        symbol: String,
+        withinMs: Long
+    ): Result<AuthoritativeClosedPnl?> {
+        return try {
+            val instId = convertSymbol(symbol)
+            val params = mutableMapOf(
+                "instType" to "SWAP",
+                "instId" to instId,
+                "limit" to "10"
+            )
+            val response = httpClient.executeSignedGet("/api/v5/account/positions-history", params)
+                ?: return Result.success(null)
+
+            val obj = json.parseToJsonElement(response).jsonObject
+            val code = obj["code"]?.jsonPrimitive?.content
+            if (code != null && code != "0") {
+                val msg = obj["msg"]?.jsonPrimitive?.content ?: "OKX error $code"
+                return Result.failure(Exception("OKX positions-history failed: $msg"))
+            }
+            val data = obj["data"]?.jsonArray ?: JsonArray(emptyList())
+            val now = System.currentTimeMillis()
+
+            // Take the most recent record for this instId that closed within window
+            val rec = data.mapNotNull { it as? JsonObject }
+                .filter { (it["instId"]?.jsonPrimitive?.content) == instId }
+                .mapNotNull { r ->
+                    val cTime = r["cTime"]?.jsonPrimitive?.content?.toLongOrNull() ?: return@mapNotNull null
+                    if (now - cTime > withinMs) return@mapNotNull null
+                    r to cTime
+                }
+                .maxByOrNull { it.second }
+                ?.first
+                ?: return Result.success(null)
+
+            val realizedPnl = rec["realizedPnl"]?.jsonPrimitive?.content?.toDoubleOrNull()
+                ?: return Result.success(null)
+            val pnlRatio = rec["pnlRatio"]?.jsonPrimitive?.content?.toDoubleOrNull()
+            val grossPnl = rec["pnl"]?.jsonPrimitive?.content?.toDoubleOrNull()
+            // OKX `fee` is trading fee only; `fundingFee` is separate. Combine
+            // for the consumer's "fees" total — both are signed (negative on outflow).
+            val tradingFee = rec["fee"]?.jsonPrimitive?.content?.toDoubleOrNull() ?: 0.0
+            val fundingFee = rec["fundingFee"]?.jsonPrimitive?.content?.toDoubleOrNull() ?: 0.0
+            val cTime = rec["cTime"]?.jsonPrimitive?.content?.toLongOrNull() ?: 0L
+
+            Result.success(
+                AuthoritativeClosedPnl(
+                    symbol = symbol,
+                    realizedPnl = realizedPnl,
+                    pnlRatio = pnlRatio,
+                    grossPnl = grossPnl,
+                    fees = tradingFee + fundingFee,
+                    closedAt = cTime
+                )
+            )
+        } catch (e: Exception) {
+            logger.error(e) { "OKX positions-history fetch failed for $symbol" }
             Result.failure(e)
         }
     }
