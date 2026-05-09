@@ -13,6 +13,7 @@ import com.cheetrader.common.model.ExecutionStatus
 import com.cheetrader.common.model.OrderExecution
 import com.cheetrader.common.model.Signal
 import com.cheetrader.common.model.SignalType
+import kotlin.coroutines.cancellation.CancellationException
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.jsonArray
@@ -350,6 +351,11 @@ class BingXExchangeService(
                 Result.failure(result.exceptionOrNull()
                     ?: BingXException("Order placement failed (no error detail)"))
             }
+        } catch (e: CancellationException) {
+            // Coroutine cancellation MUST propagate up — never pack into Result.failure.
+            // Otherwise the UI shows a fake "Job was cancelled" FAILED OrderExecution
+            // when the user logs out / switches account / session refresh cancels scope.
+            throw e
         } catch (e: Exception) {
             logger.error(e) { "Failed to execute signal ${signal.id}" }
             Result.failure(e)

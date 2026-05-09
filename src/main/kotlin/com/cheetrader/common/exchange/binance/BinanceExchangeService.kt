@@ -4,6 +4,7 @@ import com.cheetrader.common.exchange.ClosedPnlRecord
 import com.cheetrader.common.exchange.ExchangeFill
 import com.cheetrader.common.exchange.ExchangePosition
 import com.cheetrader.common.exchange.ExchangeService
+import kotlin.coroutines.cancellation.CancellationException
 import com.cheetrader.common.exchange.extractMultiTpParams
 import com.cheetrader.common.exchange.extractTrailingParams
 import com.cheetrader.common.exchange.formatPrice
@@ -329,6 +330,11 @@ class BinanceExchangeService(
                 Result.failure(orderResult.exceptionOrNull()
                     ?: BinanceException("Order placement failed (no error detail)"))
             }
+        } catch (e: CancellationException) {
+            // Coroutine cancellation MUST propagate up — never pack into Result.failure.
+            // Otherwise the UI shows a fake "Job was cancelled" FAILED OrderExecution
+            // when the user logs out / switches account / session refresh cancels scope.
+            throw e
         } catch (e: Exception) {
             logger.error(e) { "Binance execute signal failed: ${signal.id}" }
             Result.failure(e)
