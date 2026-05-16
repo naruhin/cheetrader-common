@@ -470,28 +470,78 @@ class BinanceExchangeService(
             val targetSymbol = convertSymbol(symbol)
             val params = mutableMapOf("symbol" to targetSymbol)
 
-            // Cancel regular orders
+            // Cancel regular orders.
             val response = httpClient.executeSignedDelete(BinanceConstants.Endpoints.CANCEL_ALL_ORDERS, params)
                 ?: return Result.failure(BinanceException("No response from API"))
             val error = parseError(response)
             if (error != null) {
                 return Result.failure(error)
             }
+            logger.info { "Binance cancelAllOrders (regular): symbol=$targetSymbol — ok" }
 
-            // Cancel algo orders (TP, SL, trailing stop)
+            // Cancel algo orders (CONDITIONAL: STOP_MARKET / TAKE_PROFIT_MARKET / TRAILING_STOP_MARKET).
+            //
+            // Phase 4 hardening (2026-05-16): previously this whole block was
+            // silent warn-only. If the algo cancel failed (wrong endpoint,
+            // missing param, deprecated path) we had no visibility — SL/TP/Trail
+            // orphans would persist on the exchange undetected. The cancel-leg
+            // result is now surfaced as a real failure on the Result, with the
+            // full Binance response body logged for diagnosis.
+            //
+            // `algoType=CONDITIONAL` scopes the cancel to SL/TP/Trail orders
+            // placed via `/fapi/v1/algoOrder` with `algoType=CONDITIONAL` (see
+            // `buildAlgoOrderParams`). Without this param Binance may reject as
+            // ambiguous or apply to a different algo namespace (TWAP/VP).
             try {
+                val algoParams = mutableMapOf(
+                    "symbol" to targetSymbol,
+                    "algoType" to "CONDITIONAL"
+                )
                 val algoResponse = httpClient.executeSignedDelete(
                     BinanceConstants.Endpoints.CANCEL_ALL_ALGO_ORDERS,
-                    mutableMapOf("symbol" to targetSymbol)
+                    algoParams
                 )
-                if (algoResponse != null) {
-                    val algoError = parseError(algoResponse)
-                    if (algoError != null) {
-                        logger.warn { "Binance cancel algo orders warning: ${algoError.message}" }
+                if (algoResponse == null) {
+                    // Null response = transport-level failure. Surface as real
+                    // failure so the caller (Android: addLog WARNING) sees it.
+                    logger.error {
+                        "Binance cancelAllOrders (algo): symbol=$targetSymbol — null response, " +
+                            "orphan SL/TP/Trail orders may remain"
+                    }
+                    return Result.failure(BinanceException("algo cancel: no response from API"))
+                }
+                val algoError = parseError(algoResponse)
+                if (algoError != null) {
+                    // -2011 "Unknown order sent" etc. = no algo orders to cancel,
+                    // which is the common no-op case. Treat as success but log
+                    // body so we can spot real failures (auth, malformed param).
+                    val benign = algoError.message?.contains("Unknown order", ignoreCase = true) == true ||
+                        algoError.message?.contains("No need to cancel", ignoreCase = true) == true
+                    if (benign) {
+                        logger.info {
+                            "Binance cancelAllOrders (algo): symbol=$targetSymbol — " +
+                                "no algo orders to cancel (${algoError.message})"
+                        }
+                    } else {
+                        logger.error {
+                            "Binance cancelAllOrders (algo): symbol=$targetSymbol — " +
+                                "real error ${algoError.message}; orphan SL/TP/Trail orders may remain. " +
+                                "Response body: $algoResponse"
+                        }
+                        return Result.failure(algoError)
+                    }
+                } else {
+                    logger.info {
+                        "Binance cancelAllOrders (algo): symbol=$targetSymbol — ok " +
+                            "(response: ${algoResponse.take(200)})"
                     }
                 }
             } catch (e: Exception) {
-                logger.warn { "Binance cancel algo orders warning: ${e.message}" }
+                logger.error(e) {
+                    "Binance cancelAllOrders (algo): symbol=$targetSymbol — exception; " +
+                        "orphan SL/TP/Trail orders may remain"
+                }
+                return Result.failure(e)
             }
 
             Result.success(Unit)

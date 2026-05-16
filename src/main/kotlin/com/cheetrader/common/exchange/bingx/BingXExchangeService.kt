@@ -441,12 +441,22 @@ class BingXExchangeService(
             val jsonResponse = json.parseToJsonElement(response).jsonObject
             val code = jsonResponse["code"]?.jsonPrimitive?.intOrNull
 
-            if (code == BingXConstants.ErrorCodes.SUCCESS) {
-                Result.success(Unit)
-            } else {
+            if (code != BingXConstants.ErrorCodes.SUCCESS) {
                 val msg = jsonResponse["msg"]?.jsonPrimitive?.content ?: "Unknown error"
-                Result.failure(BingXApiException(code ?: -1, msg))
+                return Result.failure(BingXApiException(code ?: -1, msg))
             }
+
+            // Phase 4 hardening (2026-05-16): BingX places TP / Trailing as
+            // regular orders via `/openApi/swap/v2/trade/order` — they SHOULD
+            // be covered by `allOpenOrders` DELETE. Log a summary of the
+            // cancel response so a future regression (BingX changing where
+            // TRAILING_STOP_MARKET lives) surfaces in production logs instead
+            // of silently leaving orphans.
+            logger.info {
+                "BingX cancelAllOrders: symbol=$bingxSymbol — ok " +
+                    "(response: ${response.take(300)})"
+            }
+            Result.success(Unit)
         } catch (e: Exception) {
             logger.error(e) { "Failed to cancel orders for $symbol" }
             Result.failure(e)

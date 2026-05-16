@@ -117,6 +117,41 @@ interface ExchangeService {
         symbol: String,
         withinMs: Long = 300_000L
     ): Result<AuthoritativeClosedPnl?> = Result.success(null)
+
+    /**
+     * Translate placement-time algo / conditional order IDs to the regular
+     * order IDs that were materialized when each algo triggered.
+     *
+     * Client-authoritative close attribution v2 (2026-05-16). When a TP / SL /
+     * trailing algo order fires on Binance Futures or OKX, the resulting fill
+     * carries a regular `orderId` that **differs** from the `algoId` returned
+     * at placement. `getRecentFills` returns the regular `orderId`, but the
+     * client stored `algoId` on `ActiveTrade.slOrderId / tpOrderIds /
+     * trailingOrderId`. Without translation, `fill.orderId == storedAlgoId`
+     * never matches and close-reason attribution falls back to price
+     * proximity (still works, but with lower confidence).
+     *
+     * Adapters that have an exchange-side endpoint to map `algoId → ordId`:
+     *   - **OKX**: `GET /api/v5/trade/orders-algo-history` ✓
+     *   - **Binance**: TODO — endpoint not yet verified.
+     *   - **Bybit**: not applicable (positional SL / trailing have no algoId).
+     *   - **BingX**: not applicable (TP and trailing already use regular orderIds;
+     *     SL is embedded in the entry order — no separate id to translate).
+     *
+     * Default returns an empty map — the resolver falls through to price
+     * proximity strategy which works across all exchanges.
+     *
+     * @param symbol  canonical symbol (adapter normalises per exchange)
+     * @param algoIds set of placement-time algo IDs to translate; if empty
+     *                returns empty map without an API call
+     * @return map of `algoId → materialized orderId`. Algo IDs that never
+     *         triggered (still pending or already cancelled) are absent from
+     *         the map. Algo IDs not recognised by the exchange are also absent.
+     */
+    suspend fun resolveAlgoExecution(
+        symbol: String,
+        algoIds: Set<String>
+    ): Result<Map<String, String>> = Result.success(emptyMap())
 }
 
 /**

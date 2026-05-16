@@ -330,21 +330,59 @@ class BinanceExchangeServiceTest {
     // ===== cancelAllOrders =====
 
     @Test
-    fun `cancelAllOrders success`() = runTest {
+    fun `cancelAllOrders success — both regular and algo legs succeed`() = runTest {
+        // Phase 4 hardening (2026-05-16): test now enqueues BOTH HTTP responses
+        // — previously only the regular-cancel response was enqueued, so the
+        // algo-cancel leg ran against an empty mock queue and silently no-op'd,
+        // leaving the orphan-SL/TP/Trail bug invisible to unit tests.
         mock.enqueue(BinanceResponses.serverTime())
-        mock.enqueue(BinanceResponses.cancelSuccess())
+        mock.enqueue(BinanceResponses.cancelSuccess()) // regular cancel
+        mock.enqueue(BinanceResponses.cancelSuccess()) // algo cancel
 
         val result = service.cancelAllOrders("BTCUSDT")
         assertTrue(result.isSuccess)
     }
 
     @Test
-    fun `cancelAllOrders API error`() = runTest {
+    fun `cancelAllOrders regular-leg API error fails the whole call`() = runTest {
         mock.enqueue(BinanceResponses.serverTime())
         mock.enqueue(BinanceResponses.apiError(-1000, "Unknown error"))
 
         val result = service.cancelAllOrders("BTCUSDT")
         assertTrue(result.isFailure)
+    }
+
+    @Test
+    fun `cancelAllOrders algo-leg failure now surfaces (was silently swallowed)`() = runTest {
+        // Phase 4 hardening: a real algo cancel failure (auth, malformed param,
+        // missing algoType) must now produce Result.failure so the caller can
+        // log it instead of leaving orphan SL/TP/Trail orders silently alive.
+        mock.enqueue(BinanceResponses.serverTime())
+        mock.enqueue(BinanceResponses.cancelSuccess())                 // regular ok
+        mock.enqueue(BinanceResponses.apiError(-1102, "Invalid algoType")) // algo fails
+
+        val result = service.cancelAllOrders("BTCUSDT")
+        assertTrue(
+            result.isFailure,
+            "real algo cancel error must surface — was silently warn-only pre-Phase-4"
+        )
+    }
+
+    @Test
+    fun `cancelAllOrders algo-leg benign no-orders-to-cancel is treated as success`() = runTest {
+        // Binance returns -2011 "Unknown order sent" when there's nothing to
+        // cancel on the algo side (common case: position closed cleanly via
+        // exchange-triggered SL fill, algo siblings auto-removed). That must
+        // NOT propagate as failure.
+        mock.enqueue(BinanceResponses.serverTime())
+        mock.enqueue(BinanceResponses.cancelSuccess())                  // regular ok
+        mock.enqueue(BinanceResponses.apiError(-2011, "Unknown order sent")) // algo benign
+
+        val result = service.cancelAllOrders("BTCUSDT")
+        assertTrue(
+            result.isSuccess,
+            "benign 'Unknown order sent' on algo leg must NOT fail the cancel"
+        )
     }
 
     // ===== getMarketPrice =====

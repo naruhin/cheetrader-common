@@ -26,6 +26,7 @@ object OkxConstants {
         const val ORDER_ALGO = "/api/v5/trade/order-algo"
         const val CANCEL_ALGOS = "/api/v5/trade/cancel-algos"
         const val ORDERS_ALGO_PENDING = "/api/v5/trade/orders-algo-pending"
+        const val ORDERS_ALGO_HISTORY = "/api/v5/trade/orders-algo-history"
     }
 }
 

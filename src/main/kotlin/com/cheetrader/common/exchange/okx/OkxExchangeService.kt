@@ -893,6 +893,70 @@ class OkxExchangeService(
         return allIds
     }
 
+    /**
+     * Translate placement-time algo IDs to triggered regular order IDs.
+     *
+     * Client-authoritative close attribution v2 (2026-05-16). OKX algo orders
+     * (conditional / OCO / move_order_stop) carry an `algoId` at placement;
+     * when they trigger, the resulting fill on `/api/v5/trade/fills-history`
+     * carries a regular `ordId` instead. Without this translation the
+     * close-reason resolver can't directly match algo IDs against fill IDs.
+     *
+     * Implementation queries `/api/v5/trade/orders-algo-history` per ordType
+     * (matching the same set as `getPendingAlgoOrders`) and extracts
+     * `algoId → ordId` pairs where `ordId` is non-empty (i.e. the algo
+     * actually triggered and materialized a regular order).
+     *
+     * @param symbol  canonical symbol (e.g. "BTC-USDT-SWAP")
+     * @param algoIds set of algo IDs we want translated; algo IDs not present
+     *                in the response (still pending or unknown) are absent
+     *                from the returned map
+     */
+    override suspend fun resolveAlgoExecution(
+        symbol: String,
+        algoIds: Set<String>
+    ): Result<Map<String, String>> {
+        if (algoIds.isEmpty()) return Result.success(emptyMap())
+        return try {
+            val instId = convertSymbol(symbol)
+            val wanted = algoIds.toSet()
+            val mapping = mutableMapOf<String, String>()
+            val types = listOf("conditional", "oco", "trigger", "move_order_stop")
+            for (type in types) {
+                val response = httpClient.executeSignedGet(
+                    OkxConstants.Endpoints.ORDERS_ALGO_HISTORY,
+                    mapOf("instId" to instId, "ordType" to type, "limit" to "100")
+                ) ?: continue
+
+                val error = parseError(response)
+                if (error != null) {
+                    logger.warn { "OKX resolveAlgoExecution: type=$type failed — ${error.message}" }
+                    continue
+                }
+
+                val obj = json.parseToJsonElement(response).jsonObject
+                val data = obj["data"]?.jsonArray ?: continue
+                for (item in data) {
+                    val rec = item.jsonObject
+                    val algoId = rec["algoId"]?.jsonPrimitive?.content ?: continue
+                    if (algoId !in wanted) continue
+                    val ordId = rec["ordId"]?.jsonPrimitive?.content
+                    if (!ordId.isNullOrBlank() && ordId != "0") {
+                        mapping[algoId] = ordId
+                    }
+                }
+                if (mapping.size == wanted.size) break // got them all
+            }
+            logger.info {
+                "OKX resolveAlgoExecution: resolved ${mapping.size}/${wanted.size} algo IDs for $instId"
+            }
+            Result.success(mapping)
+        } catch (e: Exception) {
+            logger.warn { "OKX resolveAlgoExecution: unexpected error — ${e.message}" }
+            Result.failure(e)
+        }
+    }
+
     private suspend fun setLeverage(instId: String, posSide: String?) {
         try {
             val mgnMode = resolveMarginMode()
