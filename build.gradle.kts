@@ -5,7 +5,7 @@ plugins {
 }
 
 group = "com.github.naruhin"
-version = project.findProperty("version") as String? ?: "0.3.17"
+version = project.findProperty("version") as String? ?: "0.3.18"
 
 java {
     sourceCompatibility = JavaVersion.VERSION_17

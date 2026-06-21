@@ -89,13 +89,13 @@ class BybitHttpClient(
                 conn.connectTimeout = 10000
                 conn.readTimeout = 10000
 
-                if (conn.responseCode == HttpURLConnection.HTTP_OK) {
+                val status = conn.responseCode
+                val body = if (status == HttpURLConnection.HTTP_OK) {
                     conn.inputStream.bufferedReader().use { it.readText() }
                 } else {
-                    val error = conn.errorStream?.bufferedReader()?.use { it.readText() }
-                    logger.error { "Bybit GET $path failed: ${conn.responseCode} - $error" }
-                    null
+                    conn.errorStream?.bufferedReader()?.use { it.readText() }
                 }
+                normalizeResponse(path, status, body)
             } catch (e: Exception) {
                 logger.error(e) { "Bybit GET $path error" }
                 null
@@ -126,13 +126,13 @@ class BybitHttpClient(
                 conn.connectTimeout = 10000
                 conn.readTimeout = 10000
 
-                if (conn.responseCode == HttpURLConnection.HTTP_OK) {
+                val status = conn.responseCode
+                val body = if (status == HttpURLConnection.HTTP_OK) {
                     conn.inputStream.bufferedReader().use { it.readText() }
                 } else {
-                    val error = conn.errorStream?.bufferedReader()?.use { it.readText() }
-                    logger.error { "Bybit signed GET $path failed: ${conn.responseCode} - $error" }
-                    error
+                    conn.errorStream?.bufferedReader()?.use { it.readText() }
                 }
+                normalizeResponse(path, status, body)
             } catch (e: Exception) {
                 logger.error(e) { "Bybit signed GET $path error" }
                 null
@@ -168,13 +168,13 @@ class BybitHttpClient(
                     os.flush()
                 }
 
-                if (conn.responseCode == HttpURLConnection.HTTP_OK) {
+                val status = conn.responseCode
+                val body = if (status == HttpURLConnection.HTTP_OK) {
                     conn.inputStream.bufferedReader().use { it.readText() }
                 } else {
-                    val error = conn.errorStream?.bufferedReader()?.use { it.readText() }
-                    logger.error { "Bybit POST $path failed: ${conn.responseCode} - $error" }
-                    error
+                    conn.errorStream?.bufferedReader()?.use { it.readText() }
                 }
+                normalizeResponse(path, status, body)
             } catch (e: Exception) {
                 logger.error(e) { "Bybit POST $path error" }
                 null
@@ -182,5 +182,36 @@ class BybitHttpClient(
                 conn?.disconnect()
             }
         }
+    }
+
+    /**
+     * Guards against empty or non-JSON HTTP bodies that would otherwise reach
+     * [Json.parseToJsonElement] in the callers and surface the cryptic
+     * kotlinx.serialization error "unexpected end of the input at path: $"
+     * (observed on connect when Bybit returns an empty body or a CDN block
+     * page — e.g. a geo-restricted region or a revoked key).
+     *
+     * Caller contract:
+     *  - `null`            → no usable response; callers fail with "No response".
+     *  - valid JSON string → either Bybit's real body, or a synthetic
+     *                        `{"retCode":<http>,"retMsg":...}` so `parseError`
+     *                        produces a meaningful exception instead of a crash.
+     */
+    private fun normalizeResponse(path: String, status: Int, rawBody: String?): String? {
+        val body = rawBody?.trim().orEmpty()
+        if (status == HttpURLConnection.HTTP_OK) {
+            if (body.isEmpty()) {
+                logger.error { "Bybit $path: HTTP 200 with empty body" }
+                return null
+            }
+            if (!body.startsWith("{") && !body.startsWith("[")) {
+                logger.error { "Bybit $path: HTTP 200 non-JSON body: ${body.take(200)}" }
+                return """{"retCode":-1,"retMsg":"Unexpected non-JSON response from Bybit"}"""
+            }
+            return body
+        }
+        logger.error { "Bybit $path: HTTP $status body=${body.take(200)}" }
+        if (body.startsWith("{")) return body
+        return """{"retCode":$status,"retMsg":"HTTP $status from Bybit (check region access / API key permissions)"}"""
     }
 }
