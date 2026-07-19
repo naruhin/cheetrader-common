@@ -34,7 +34,13 @@ class BinanceLiquidationWebSocketClient(
     private val freshnessThresholdMs: Long = 120_000,
 ) : ExchangeWebSocketClient {
 
-    private val endpoint = URI.create("$baseWsUrl/ws/$STREAM")
+    // ROUTED endpoint (`/market/ws/…`), not the legacy unrouted `/ws/…`. Binance decommissioned the
+    // unrouted Futures WS URLs on 2026-04-23: they still complete the handshake but deliver ZERO frames
+    // (silent) — which made this liquidation stream produce 0 events for 31h in prod. Verified live: the
+    // routed URL delivers real `!forceOrder@arr` frames (11 liquidations/90s) while `/ws/` delivers none.
+    // See knowledge/bugs/2026-05-10-binance-futures-routed-ws-endpoints-decommission + the 2026-07-19 shadow
+    // pipelines entry. forceOrder is a market-data stream → `/market` routing group (like kline/markPrice).
+    private val endpoint = URI.create("$baseWsUrl/market/ws/$STREAM")
     private val httpClient: HttpClient = HttpClient.newHttpClient()
     private val json = Json { ignoreUnknownKeys = true }
 
