@@ -41,6 +41,9 @@ class BinanceLiquidationWebSocketClient(
     private val running = AtomicBoolean(false)
     private val reconnectPending = AtomicBoolean(false)
     private val lastMessageAt = AtomicLong(0)
+    // RAW frame count — every inbound message BEFORE parse/dedup/universe filtering. Lets a caller
+    // distinguish "endpoint delivers nothing" (0) from "endpoint fine but no universe-symbol match".
+    private val frameCount = AtomicLong(0)
     private val backoff = ExponentialBackoff()
 
     private val reconnectExecutor = Executors.newSingleThreadScheduledExecutor { r ->
@@ -77,6 +80,15 @@ class BinanceLiquidationWebSocketClient(
         val last = lastMessageAt.get()
         if (last == 0L) return false
         return clock.millis() - last < freshnessThresholdMs
+    }
+
+    /** Total RAW inbound frames since start (all-market, pre-filter). 0 ⇒ endpoint delivered nothing. */
+    fun framesReceived(): Long = frameCount.get()
+
+    /** Millis since the last RAW inbound frame, or -1 if none ever received. */
+    fun lastRawFrameAgeMs(): Long {
+        val last = lastMessageAt.get()
+        return if (last == 0L) -1L else clock.millis() - last
     }
 
     private fun connect() {
@@ -116,6 +128,7 @@ class BinanceLiquidationWebSocketClient(
     /** Full inbound pipe (parse + dedup + deliver). Internal for test injection without a socket. */
     internal fun handleMessage(raw: String) {
         lastMessageAt.set(clock.millis())
+        frameCount.incrementAndGet()
         val event = parse(raw) ?: return
         val key = "${event.symbol}|${event.tradeTimeMs}|${event.price}|${event.quantity}"
         if (!markSeen(key)) return
