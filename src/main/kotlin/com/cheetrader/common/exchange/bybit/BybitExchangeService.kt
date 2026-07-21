@@ -260,21 +260,30 @@ class BybitExchangeService(
     private suspend fun getBalanceInternal(): Result<Double> {
         return try {
             httpClient.syncTime()
-            val balance = fetchBalance("UNIFIED")
-            if (balance != null) {
-                return Result.success(balance)
-            }
 
-            val fallback = fetchBalance("CONTRACT")
-            if (fallback != null) {
-                Result.success(fallback)
-            } else {
-                Result.failure(BybitException("Cannot parse balance"))
-            }
+            val unified = fetchBalance("UNIFIED")
+            if (unified is BalanceResult.Ok) return Result.success(unified.value)
+
+            val contract = fetchBalance("CONTRACT")
+            if (contract is BalanceResult.Ok) return Result.success(contract.value)
+
+            // Both account types failed. Surface the real reasons (API retCode /
+            // permission / empty response) instead of the old generic
+            // "Cannot parse balance", which masked the actual cause on connect.
+            val reason = "Cannot read Bybit balance — " +
+                "UNIFIED: ${(unified as BalanceResult.Err).message}; " +
+                "CONTRACT: ${(contract as BalanceResult.Err).message}"
+            logger.warn { reason }
+            Result.failure(BybitException(reason))
         } catch (e: Exception) {
             logger.error(e) { "Bybit get balance failed" }
             Result.failure(e)
         }
+    }
+
+    private sealed interface BalanceResult {
+        data class Ok(val value: Double) : BalanceResult
+        data class Err(val message: String) : BalanceResult
     }
 
     private suspend fun <T> tryWithBaseUrls(action: suspend () -> Result<T>): Result<T> {
@@ -503,32 +512,44 @@ class BybitExchangeService(
         }
     }
 
-    private suspend fun fetchBalance(accountType: String): Double? {
+    private suspend fun fetchBalance(accountType: String): BalanceResult {
         val response = httpClient.executeSignedGet(
             BybitConstants.Endpoints.WALLET_BALANCE,
             mapOf(
                 "accountType" to accountType,
                 "coin" to "USDT"
             )
-        ) ?: return null
+        ) ?: return BalanceResult.Err("no response ($accountType)")
 
-        val error = parseError(response)
-        if (error != null) {
-            return null
+        parseError(response)?.let { error ->
+            logger.warn { "Bybit wallet-balance API error ($accountType): ${error.message}" }
+            return BalanceResult.Err(error.message ?: "API error ($accountType)")
         }
 
-        val obj = json.parseToJsonElement(response).jsonObject
-        val list = obj["result"]?.jsonObject?.get("list")?.jsonArray ?: JsonArray(emptyList())
-        val first = list.firstOrNull()?.jsonObject ?: return null
-        val coins = first["coin"]?.jsonArray ?: JsonArray(emptyList())
+        return try {
+            val obj = json.parseToJsonElement(response).jsonObject
+            val list = obj["result"]?.jsonObject?.get("list")?.jsonArray ?: JsonArray(emptyList())
+            val first = list.firstOrNull()?.jsonObject
+                ?: return BalanceResult.Err("empty wallet list ($accountType)")
+                    .also { logger.warn { "Bybit wallet-balance empty list ($accountType): $response" } }
 
-        val usdt = coins.firstOrNull {
-            it.jsonObject["coin"]?.jsonPrimitive?.content == "USDT"
-        }?.jsonObject ?: return null
+            val coins = first["coin"]?.jsonArray ?: JsonArray(emptyList())
+            // No USDT coin under this account type — soft failure so getBalanceInternal
+            // still falls back to the other account type (classic accounts hold funds
+            // under CONTRACT, not UNIFIED).
+            val usdt = coins.firstOrNull {
+                it.jsonObject["coin"]?.jsonPrimitive?.content == "USDT"
+            }?.jsonObject
+                ?: return BalanceResult.Err("no USDT under $accountType")
 
-        val available = usdt["availableToWithdraw"]?.jsonPrimitive?.content?.toDoubleOrNull()
-        val wallet = usdt["walletBalance"]?.jsonPrimitive?.content?.toDoubleOrNull()
-        return available ?: wallet
+            val available = usdt["availableToWithdraw"]?.jsonPrimitive?.content?.toDoubleOrNull()
+            val wallet = usdt["walletBalance"]?.jsonPrimitive?.content?.toDoubleOrNull()
+            (available ?: wallet)?.let { BalanceResult.Ok(it) }
+                ?: BalanceResult.Err("USDT balance fields empty ($accountType)")
+        } catch (e: Exception) {
+            logger.warn { "Bybit wallet-balance parse failed ($accountType): ${e.message} — $response" }
+            BalanceResult.Err("parse error ($accountType): ${e.message}")
+        }
     }
 
     private suspend fun setLeverage(symbol: String) {
